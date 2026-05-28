@@ -1,0 +1,14 @@
+---
+type: showroom
+view_switcher:
+  enabled: true
+  default_mode: split
+persist_url_state: true
+tabs:
+ - name: Terminal 1
+   secondary_name: Terminal 2
+   type: 'double-terminal'
+ - name: OpenShift Console
+   url: '{openshift_console_url}'
+ - name: OpenShift AI Dashboard
+   url: 'https://rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}'

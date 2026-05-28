@@ -1,0 +1,379 @@
+= Module 2: Remediate the blockers
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+The assessment found four blocking findings, all components that 3.x removes. In this module you'll clear them in the correct order, patch the model-serving ConfigMap, stop the workbenches, and uninstall the 2.x KServe Serverless operator stack.
+
+Order matters here. The KServe Serverless teardown must drain before you remove the Service Mesh dependency, and the Service Mesh member roll has to be deleted before its operator can be uninstalled. You'll do each step and verify it before moving on.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`) to `Removed`
+* Disable KServe Serverless mode and switch the default deployment mode to RawDeployment
+* Remove the Service Mesh dependency cleanly, including the lingering member roll
+* Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
+
+== Exercise 2.1: Disable Kueue
+
+RHOAI 2.25 deprecated the embedded Kueue distribution; 3.3 removes it. Leaving Kueue `Managed` at upgrade time is the highest-risk mistake in the whole migration: the Kueue admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster -not just RHOAI.
+
+Flip Kueue to `Removed`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kueue": { "managementState": "Removed" } } }
+}'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='kueue: {.spec.components.kueue.managementState}{"\n"}'
+oc get dsc default-dsc -o jsonpath='{range .status.conditions[?(@.type=="KueueReady")]}{.status} {.reason}{"\n"}{end}'
+----
+
+[.console-output]
+----
+kueue: Removed
+False Removed
+----
+
+✓ `kueue` is `Removed`. The `KueueReady=False` with reason `Removed` is expected and correct -the component is intentionally gone.
+
+== Exercise 2.2: Disable Ray and CodeFlare
+
+The 3.x release drops the CodeFlare operator; KubeRay continues to manage Ray clusters directly. The DSC has *two* separate components, `codeflare` and `ray`, even though the assessment reports the blocker under the `ray/removal` check. Flip both:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": {
+    "codeflare": { "managementState": "Removed" },
+    "ray":       { "managementState": "Removed" }
+  } }
+}'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='ray={.spec.components.ray.managementState} codeflare={.spec.components.codeflare.managementState}{"\n"}'
+----
+
+[.console-output]
+----
+ray=Removed codeflare=Removed
+----
+
+✓ Both `ray` and `codeflare` are `Removed`
+
+== Exercise 2.3: Disable ModelMesh Serving
+
+ModelMesh Serving is removed in 3.x. Any models you keep serving will use KServe RawDeployment instead. Flip the component to `Removed`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "modelmeshserving": { "managementState": "Removed" } } }
+}'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='modelmeshserving: {.spec.components.modelmeshserving.managementState}{"\n"}'
+oc get pods -n redhat-ods-applications -l control-plane=modelmesh-controller --no-headers 2>/dev/null | wc -l
+----
+
+[.console-output]
+----
+modelmeshserving: Removed
+0
+----
+
+✓ `modelmeshserving` is `Removed` and its controller pods are gone
+
+== Exercise 2.4: Patch the model-serving ConfigMap
+
+Before disabling KServe Serverless, set the `inferenceservice-config` ConfigMap to unmanaged and add the hardware-profile annotations to its disallowed list. Without this, deployed models can get restarted during the upgrade. This was the `advisory` finding in your assessment -on a cluster with running models it is important, not optional.
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-applications annotate configmap inferenceservice-config \
+  opendatahub.io/managed=false --overwrite
+
+NEW_JSON=$(oc -n redhat-ods-applications get cm inferenceservice-config \
+  -o jsonpath='{.data.inferenceService}' \
+  | jq -c '.serviceAnnotationDisallowedList |= (. + ["opendatahub.io/hardware-profile-name", "opendatahub.io/hardware-profile-namespace"] | unique)')
+
+oc -n redhat-ods-applications patch cm inferenceservice-config --type=merge \
+  -p "$(jq -n --arg v "$NEW_JSON" '{data: {inferenceService: $v}}')"
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-applications get cm inferenceservice-config \
+  -o jsonpath='managed={.metadata.annotations.opendatahub\.io/managed}{"\n"}'
+oc -n redhat-ods-applications get cm inferenceservice-config \
+  -o jsonpath='{.data.inferenceService}' | jq '.serviceAnnotationDisallowedList'
+----
+
+✓ Annotation `opendatahub.io/managed` is `false`
+
+✓ The disallowed list now contains `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace`
+
+== Exercise 2.5: Stop the workbenches
+
+All workbenches must be stopped before the upgrade. Unmigrated, running workbenches hit redirect loops under the new 3.x authentication model. The notebook controller treats the `kubeflow-resource-stopped` annotation as "stopped if present" -the dashboard sets it to a timestamp, so use one here too.
+
+First, survey what's running (by pod count, which is the reliable signal):
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb has $pods pod(s) running"
+done
+----
+
+Stop every workbench (in a real migration this disconnects active users, so it happens in the maintenance window):
+
+[.console-input]
+[source,role="execute"]
+----
+STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
+  ns="${row%/*}"; name="${row##*/}"
+  oc -n "$ns" annotate notebook "$name" \
+    kubeflow-resource-stopped="$STAMP" --overwrite
+done
+----
+
+=== Verify
+
+Re-run the survey -it should print nothing:
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb still has $pods pod(s)"
+done
+echo "survey complete"
+----
+
+[.console-output]
+----
+survey complete
+----
+
+✓ No workbench reports running pods
+
+== Exercise 2.6: Disable KServe Serverless mode
+
+This is the largest reconciliation in the sequence. Setting `serving` to `Removed` tears down the Knative stack; setting `defaultDeploymentMode` to `RawDeployment` ensures the next model created uses the supported 3.x mode.
+
+[WARNING]
+====
+On a cluster with deployed models, confirm every InferenceService is already `RawDeployment` before this step so it isn't caught in the Serverless teardown:
+
+`oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.annotations.serving\.kserve\.io/deploymentMode}{"\n"}{end}'`
+
+Every line should end in `=RawDeployment`. If any are Serverless, convert them first.
+====
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kserve": {
+    "serving": { "managementState": "Removed" },
+    "defaultDeploymentMode": "RawDeployment"
+  } } }
+}'
+----
+
+This takes several minutes. Watch the Knative stack drain:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get knativeserving -A
+----
+
+Re-run the command until it reports `No resources found`.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='serving={.spec.components.kserve.serving.managementState} mode={.spec.components.kserve.defaultDeploymentMode}{"\n"}'
+oc get knativeserving -A 2>&1 | tail -1
+----
+
+[.console-output]
+----
+serving=Removed mode=RawDeployment
+No resources found
+----
+
+✓ `serving=Removed`, `defaultDeploymentMode=RawDeployment`, and Knative has drained
+
+== Exercise 2.7: Remove the Service Mesh dependency
+
+OpenShift 4.19+ handles service mesh internally, so RHOAI 3.x no longer needs the embedded Service Mesh. Set the DSCI `serviceMesh` to `Removed` -this drains the ServiceMeshControlPlane (SMCP):
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch dsci default-dsci --type=merge -p '{
+  "spec": { "serviceMesh": { "managementState": "Removed" } }
+}'
+----
+
+Wait for the SMCP to drain:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get smcp -A
+----
+
+Re-run until it reports `No resources found`. Then delete the leftover ServiceMeshMemberRoll. The DSCI change drains the SMCP but does *not* delete the member roll -it lingers with a `maistra.io/istio-operator` finalizer. Delete it now, while the Service Mesh operator is still installed to process the finalizer:
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete smmr default -n istio-system --ignore-not-found
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsci default-dsci -o jsonpath='serviceMesh: {.spec.serviceMesh.managementState}{"\n"}'
+oc get smcp,smmr -A 2>&1 | tail -2
+----
+
+[.console-output]
+----
+serviceMesh: Removed
+No resources found
+----
+
+✓ `serviceMesh` is `Removed` and both the SMCP and SMMR are gone
+
+== Exercise 2.8: Uninstall the 2.x serving operators
+
+The OpenShift Serverless, Service Mesh 2, and standalone Authorino operators were dependencies of the 2.x KServe Serverless stack. With that stack removed, uninstall them. Removing their subscriptions and CSVs is enough.
+
+[.console-input]
+[source,role="execute"]
+----
+# Standalone Authorino (came in with Serverless)
+oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+
+# OpenShift Serverless
+oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+
+# Service Mesh 2 (safe now that the SMCP and SMMR are gone)
+oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
+echo "--- check complete ---"
+----
+
+[.console-output]
+----
+--- check complete ---
+----
+
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
+
+== Exercise 2.9: Re-run the assessment
+
+With every blocker resolved, re-run the lint to confirm the cluster is ready. Re-running between phases matters -some checks only clear once prior steps are done.
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 | grep -E 'blocking|✗' || echo "No blocking findings remain"
+----
+
+[.console-output]
+----
+No blocking findings remain
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.status.phase}{"\n"}'
+----
+
+✓ DSC is still `Ready`, and the assessment reports no blocking findings
+
+== Troubleshooting
+
+*Issue*: `oc delete smmr` hangs.
+
+*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Make sure you delete the SMMR *before* uninstalling the operator in Exercise 2.8. If you already uninstalled it, reinstall the operator briefly so the finalizer can be processed, then delete the SMMR.
+
+*Issue*: KServe Serverless teardown (Exercise 2.6) seems stuck.
+
+*Solution*: It can take 5-10 minutes. Watch `oc get pods -n knative-serving` -the pod count should fall to zero. If `knativeserving` never drains, check the KServe controller logs with `oc logs -n redhat-ods-applications -l app=kserve-controller-manager`.
+
+*Issue*: A DSC component won't move to `Removed`.
+
+*Solution*: Confirm you patched the correct resource path. Use `oc get dsc default-dsc -o yaml | grep -A1 <component>` to inspect the current state, and remember `codeflare` and `ray` are separate fields.
+
+== Learning outcomes
+
+You've completed the remediation phase. You can:
+
+* [x] Flip the removed DSC components to `Removed` in the correct order
+* [x] Patch the `inferenceservice-config` ConfigMap to protect running models
+* [x] Stop all workbenches before the upgrade
+* [x] Remove the Service Mesh dependency including the lingering member roll
+* [x] Uninstall the 2.x serving operators and confirm a clean assessment
+
+== Module summary
+
+The cluster is now in a pre-upgrade-clean state: every removed component is `Removed`, the Service Mesh dependency is gone, workbenches are stopped, and the assessment reports no blockers. In the next module you'll switch the operator subscription to the migration channel and drive the upgrade to {target-version}.
+
+Continue to *Module 3: Perform the upgrade*.

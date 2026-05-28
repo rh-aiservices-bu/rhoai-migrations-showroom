@@ -1,0 +1,262 @@
+= Module 4: Post-upgrade verification
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+The operator reports {target-version} and the DSC is `Ready`, but the migration isn't finished until you've verified the things that changed during the upgrade and completed the required post-upgrade tasks. In this module you'll confirm the component schema rename, check the HardwareProfile migration, patch the workbenches onto the new auth model, and verify the Gateway API is serving traffic.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Verify the operator, DSC, and DSCI are healthy on {target-version}
+* Confirm the `datasciencepipelines` to `aipipelines` schema rename and HardwareProfile migration
+* Patch stopped workbenches onto the 3.x kube-rbac-proxy auth model
+* Locate the Gateway API resources and confirm the dashboard's new URL
+
+== Exercise 4.1: Confirm platform health
+
+Start with the platform-level checks. The CSV should be {target-version} with no 2.x CSV remaining, and both the DSC and DSCI should be `Ready`.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
+oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+rhods-operator.3.3.2   Succeeded
+DSC: Ready
+DSCI: Ready
+----
+
+Check that the operator-namespace pods are running:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pods -n redhat-ods-applications --no-headers | grep -v Running | grep -v Completed || echo "all running"
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get co | grep -v "True .* False .* False" | tail -n +2 || echo "all cluster operators healthy"
+----
+
+✓ DSC and DSCI are `Ready`, the CSV is `rhods-operator.3.3.2`, and cluster operators are healthy
+
+== Exercise 4.2: Confirm the schema rename
+
+During the 3.x reconciliation the DSC `datasciencepipelines` component is renamed to `aipipelines`. Confirm the new field is present and the old one is gone:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='aipipelines={.spec.components.aipipelines.managementState}{"\n"}datasciencepipelines={.spec.components.datasciencepipelines.managementState}{"\n"}'
+----
+
+[.console-output]
+----
+aipipelines=Managed
+datasciencepipelines=
+----
+
+[NOTE]
+====
+Any automation that references `.spec.components.datasciencepipelines` must be updated to `.spec.components.aipipelines`. New DSC fields `trainer` and `mlflowoperator` also appear, both defaulting to `Removed`.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.spec.components.aipipelines.managementState}{"\n"}'
+----
+
+✓ `aipipelines` is present and `Managed`
+
+== Exercise 4.3: Confirm the HardwareProfile migration
+
+The advisory finding from Module 1 told you the 7 legacy HardwareProfiles would auto-migrate. They move from the `dashboard.opendatahub.io/v1alpha1` API group to `infrastructure.opendatahub.io`, and the objects are *renamed* in the process.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications
+----
+
+[.console-output]
+----
+NAME                              AGE
+containersize-large-notebooks     5m
+containersize-large-serving       5m
+containersize-medium-notebooks    5m
+...
+----
+
+[IMPORTANT]
+====
+The objects are renamed (for example `large-notebooks-17kpw` becomes `containersize-large-notebooks`). Any user automation or workbench definition that referenced the old names by hand needs updating.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications --no-headers | wc -l
+----
+
+✓ The migrated HardwareProfiles exist in the `infrastructure.opendatahub.io` API group
+
+== Exercise 4.4: Patch the workbenches onto the new auth model
+
+Workbenches still carry the 2.x oauth-proxy configuration. Under 3.x they need kube-rbac-proxy, or they hit redirect loops on first start. The `rhai-cli` helper patches each stopped workbench in place.
+
+Run the helper from the `rhai-cli` pod:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh patch --only-stopped --with-cleanup -y
+'
+----
+
+=== Verify
+
+List the migration status of every workbench:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh list --all
+'
+----
+
+[.console-output]
+----
+Migration status:
+  Legacy (2.x):     0
+  Migrated (3.x):   5
+OK: All workbenches have been migrated.
+----
+
+✓ All workbenches report `Migrated (3.x)`
+
+== Exercise 4.5: Verify Gateway API routing
+
+RHOAI 3.x routes through Kubernetes Gateway API instead of OpenShift Routes. The dashboard and any model endpoints now resolve through a Gateway. Confirm the GatewayConfig is ready and find the Gateway data-plane.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfigs -A -o wide
+----
+
+[.console-output]
+----
+NAME              READY
+default-gateway   True
+----
+
+The Gateway data-plane pods run in `openshift-ingress`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gateway -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,PROGRAMMED:.status.conditions[?(@.type=="Programmed")].status'
+oc get pods -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=data-science-gateway
+----
+
+The dashboard URL has changed -it's now served by the Gateway. Get the new hostname:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.spec.hostname}{"\n"}{end}'
+----
+
+[NOTE]
+====
+The pre-upgrade dashboard URL (`rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}`) no longer resolves. The new dashboard is at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. Any external consumer of a model endpoint also needs the new Gateway-based URL.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfig default-gateway -o jsonpath='{.status.phase}{"\n"}' 2>/dev/null \
+  || oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.metadata.name}: ready{"\n"}{end}'
+----
+
+✓ The GatewayConfig is ready and the Gateway data-plane pods are running in `openshift-ingress`
+
+== Exercise 4.6: Final assessment
+
+Confirm the cluster is clean on {target-version} by re-running the assessment one last time:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 | grep -E 'blocking|✗' || echo "No blocking findings -migration complete"
+----
+
+[.console-output]
+----
+No blocking findings -migration complete
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.status.release.version}{"\n"}'
+----
+
+[.console-output]
+----
+3.3.2
+----
+
+✓ The DSC reports release version `3.3.2`
+
+== Troubleshooting
+
+*Issue*: GatewayConfig stuck `Not Ready` and the dashboard URL doesn't resolve.
+
+*Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST gets rejected. Disable the operator-managed NetworkPolicy: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
+
+*Issue*: The workbench helper reports `Failed: N`.
+
+*Solution*: Do not force-start those workbenches. Inspect each with `oc describe notebook <name> -n <ns>` and open a support case. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
+
+*Issue*: `KueueReady=False` after upgrade.
+
+*Solution*: If the message says `managementState Managed is not supported`, the pre-upgrade Kueue step was missed. Re-apply it: `oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{"spec":{"components":{"kueue":{"managementState":"Removed"}}}}'`.
+
+== Learning outcomes
+
+You've completed the verification phase and the migration. You can:
+
+* [x] Verify the operator, DSC, and DSCI are healthy on {target-version}
+* [x] Confirm the `aipipelines` rename and the HardwareProfile migration
+* [x] Patch workbenches onto the 3.x auth model
+* [x] Locate the Gateway API resources and the new dashboard URL
+
+== Module summary
+
+The cluster is fully migrated to {target-version}: the platform is healthy, the schema and HardwareProfiles have migrated, workbenches are patched onto the new auth model, and Gateway API is serving traffic. Continue to the *Conclusion* to review what you accomplished.

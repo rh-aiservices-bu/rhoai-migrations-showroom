@@ -1,0 +1,23 @@
+name: modules
+title: Migrating RHOAI 2.25 to 3.3
+version: master
+start_page: index.adoc
+nav:
+  - modules/ROOT/nav.adoc
+
+asciidoc:
+  attributes:
+    lab_name: "Migrating Red Hat OpenShift AI 2.25 to 3.3"
+    release-version: master
+    page-pagination: '@'
+    source-version: "2.25"
+    target-version: "3.3.2"
+    migration-channel: "support-required-upgrade"
+    stable-channel: "stable-3.3"
+    openshift_cluster_ingress_domain: PLACEHOLDER-URL.com
+    openshift_console_url: OCP-PLACEHOLDER-URL.com
+    openshift_cluster_admin_username: admin
+    openshift_cluster_admin_password: pass
+    page-links:
+    - url: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3
+      text: RHOAI 3.3 docs

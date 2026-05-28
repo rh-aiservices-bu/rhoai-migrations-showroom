@@ -1,0 +1,22 @@
+---
+site:
+  title: "Migrating Red Hat OpenShift AI 2.25 to 3.3"
+  url: https://github.com/rhpds/rhoai-migrations-showroom
+  start_page: modules::index.adoc
+
+content:
+  sources:
+    - url: .
+      start_path: content
+
+ui:
+  bundle:
+    url: https://github.com/rhpds/rhdp_showroom_theme/releases/download/summit-2026/ui-bundle.zip
+    snapshot: true
+
+runtime:
+  fetch: true
+  cache_dir: ./.cache/antora
+
+output:
+  dir: ./www

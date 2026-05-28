@@ -1,0 +1,56 @@
+= Workshop overview: the migration you're about to run
+:toc:
+:toc-placement: preamble
+:icons: font
+
+== Your role
+
+You are the *cluster administrator* responsible for a production Red Hat OpenShift AI {source-version} environment. Red Hat has released OpenShift AI 3.x, and your organization wants to move to it for the new capabilities -unified observability, Kubeflow Trainer v2, external identity provider support, and the Gateway API networking model.
+
+You own the migration end to end: assessing readiness, clearing the blockers, running the upgrade in a maintenance window, and confirming the platform and its workloads come back healthy.
+
+== Why this is a migration, not an upgrade
+
+Previous OpenShift AI version bumps (2.19 to 2.22, 2.22 to 2.25) were routine operator upgrades. The move to 3.x is different. In a single transition:
+
+* *Routing changes*: OpenShift Routes are replaced by Kubernetes Gateway API. Model endpoint URLs and the dashboard URL change.
+* *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched.
+* *Components are removed*: the embedded Kueue, ModelMesh Serving, and CodeFlare are gone in 3.x. The embedded Service Mesh dependency is dropped (OpenShift 4.19+ handles it). Each must be set to `Removed` *before* the upgrade.
+* *Schema changes*: the DSC `datasciencepipelines` component is renamed to `aipipelines`, and HardwareProfiles move to a new API group with renamed objects.
+
+Because so much changes at once, *there is no automated rollback*. In production, the only way back is restoring from a verified backup -which is why a real migration always starts with one. In this lab the cluster is disposable, so you'll focus on the migration mechanics themselves.
+
+== The assessment-driven workflow
+
+Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster and reports what must change before the upgrade. The workflow is:
+
+. *Assess* - run `rhai-cli lint` and read the findings.
+. *Remediate* - resolve each blocking finding, re-running the assessment between phases.
+. *Upgrade* - once the assessment is clean, switch the subscription channel and approve the upgrade.
+. *Verify* - confirm the cluster is healthy on the new version and finish post-upgrade tasks.
+
+You'll follow exactly that loop.
+
+== Learning objectives
+
+By the end of this workshop you will be able to:
+
+* Run the `rhai-cli` assessment and distinguish *blocking* findings from *advisory* ones
+* Explain why each removed component (Kueue, ModelMesh, CodeFlare, Service Mesh v2) must be disabled before the upgrade
+* Disable the 2.x KServe Serverless stack and uninstall its operators in the correct order
+* Drive the OLM-managed operator upgrade through the migration channel to {target-version}
+* Verify a migrated cluster: DSC/DSCI readiness, the component schema rename, HardwareProfile migration, workbench auth patching, and Gateway API routing
+
+== Estimated time
+
+[cols="3,1",options="header"]
+|===
+| Module | Time
+| Module 1: Assess the cluster | 20 min
+| Module 2: Remediate the blockers | 40 min
+| Module 3: Perform the upgrade | 30 min
+| Module 4: Post-upgrade verification | 25 min
+| *Total* | *~2 hours*
+|===
+
+When you're ready, move on to *Module 1*.

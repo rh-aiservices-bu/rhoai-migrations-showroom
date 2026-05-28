@@ -1,0 +1,245 @@
+= Module 3: Perform the upgrade
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+The cluster is pre-upgrade-clean. Now you'll trigger the actual migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to {target-version}.
+
+The migration channel is intentionally separate from the normal release channels so the upgrade can't be triggered by accident. You'll see OLM walk the upgrade graph one release at a time, and you'll approve each step. When it's done, you'll move the subscription onto the stable channel so the cluster receives ongoing patch updates.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Switch the operator subscription to the `{migration-channel}` migration channel
+* Approve the OLM InstallPlans as the upgrade walks to {target-version}
+* Confirm the operator and DSC reach a healthy state on the new version
+* Move the subscription to the `{stable-channel}` channel for ongoing updates
+
+== Exercise 3.1: Inspect the current subscription
+
+Look at where the subscription points today. The approval mode is `Manual`, which is what you want -it forces you to approve each step rather than auto-upgrading.
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-operator get subscription rhods-operator \
+  -o jsonpath='channel={.spec.channel}{"\n"}approval={.spec.installPlanApproval}{"\n"}installedCSV={.status.installedCSV}{"\n"}'
+----
+
+[.console-output]
+----
+channel=stable-2.25
+approval=Manual
+installedCSV=rhods-operator.2.25.6
+----
+
+See which channels the catalog offers. `{migration-channel}` is the one that triggers the 2 to 3 migration:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get packagemanifest rhods-operator -n openshift-marketplace \
+  -o jsonpath='{range .status.channels[*]}{.name}  {.currentCSV}{"\n"}{end}' | grep -E 'support-required-upgrade|stable-3'
+----
+
+[.console-output]
+----
+stable-3.3                 rhods-operator.3.3.2
+stable-3.x                 rhods-operator.3.4.0
+support-required-upgrade   rhods-operator.3.3.2
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='{.spec.installPlanApproval}{"\n"}'
+----
+
+✓ Output is `Manual` -InstallPlans will wait for your approval
+
+== Exercise 3.2: Switch to the migration channel
+
+Point the subscription at the migration channel:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-operator patch subscription rhods-operator --type=merge -p '{
+  "spec": { "channel": "support-required-upgrade" }
+}'
+----
+
+OLM now generates an InstallPlan. Confirm one appears (unapproved):
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-operator get installplan \
+  -o custom-columns='NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[0],APPROVED:.spec.approved'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='channel={.spec.channel}{"\n"}'
+----
+
+[.console-output]
+----
+channel=support-required-upgrade
+----
+
+✓ The subscription is on the migration channel and an unapproved InstallPlan exists
+
+== Exercise 3.3: Approve the upgrade
+
+[IMPORTANT]
+====
+OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.6` you'll see *one* InstallPlan (`2.25.6` to `3.3.2`). From a cluster on an earlier 2.25 patch you may see *two* in sequence (for example `2.25.5` to `2.25.6`, then `2.25.6` to `3.3.2`). Each requires its own approval because the channel uses Manual approval.
+====
+
+This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
+
+[.console-input]
+[source,role="execute"]
+----
+deadline=$(( $(date +%s) + 1800 ))
+while (( $(date +%s) < deadline )); do
+  IP=$(oc -n redhat-ods-operator get installplan -o json \
+    | jq -r '.items[] | select(.spec.approved==false) | .metadata.name' | head -1)
+  if [ -n "$IP" ]; then
+    echo "Approving InstallPlan $IP ..."
+    oc -n redhat-ods-operator patch installplan "$IP" --type=merge -p '{"spec":{"approved":true}}'
+    sleep 30
+    continue
+  fi
+  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.2 -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo "rhods-operator.3.3.2 phase: ${phase:-<pending>}"
+  [ "$phase" = "Succeeded" ] && break
+  sleep 30
+done
+----
+
+This runs for several minutes as OLM installs each release. When it exits, check the CSV:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator | grep rhods-operator
+----
+
+[.console-output]
+----
+rhods-operator.3.3.2   Red Hat OpenShift AI   3.3.2   rhods-operator.2.25.6   Succeeded
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayName=="Red Hat OpenShift AI")]}{.metadata.name} {.status.phase}{"\n"}{end}'
+----
+
+✓ `rhods-operator.3.3.2` is `Succeeded` and no `rhods-operator.2.*` CSV remains
+
+== Exercise 3.4: Wait for the DSC and DSCI to settle
+
+The new operator reconciles the DSC and DSCI under the 3.x model. Wait for both to return to `Ready`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc wait --for=jsonpath='{.status.phase}'=Ready dsc/default-dsc --timeout=20m
+oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+datasciencecluster.datasciencecluster.opendatahub.io/default-dsc condition met
+DSCI phase: Ready
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+DSC: Ready
+DSCI: Ready
+----
+
+✓ Both the DSC and DSCI are `Ready` under {target-version}
+
+== Exercise 3.5: Move off the migration channel
+
+The `{migration-channel}` channel is a one-shot trigger -it does not advance to later 3.3.x patch releases. Leaving the subscription there means the cluster gets no ongoing z-stream updates. Move it to the stable 3.3 channel:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch subscription rhods-operator -n redhat-ods-operator --type=merge -p '{
+  "spec": { "channel": "stable-3.3" }
+}'
+----
+
+[NOTE]
+====
+Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (which would eventually offer a 3.4 minor upgrade -a separate planning decision, not a patch).
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get subscription rhods-operator -n redhat-ods-operator \
+  -o jsonpath='channel={.spec.channel}  state={.status.state}  installedCSV={.status.installedCSV}{"\n"}'
+----
+
+[.console-output]
+----
+channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.2
+----
+
+✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.2`
+
+== Troubleshooting
+
+*Issue*: The approval loop times out without reaching `Succeeded`.
+
+*Solution*: Check the operator logs with `oc logs -n redhat-ods-operator deploy/rhods-operator --tail=50`. A stuck InstallPlan usually means a removed component was left `Managed` -re-run the Module 1 assessment to find which one, fix it, and the upgrade resumes.
+
+*Issue*: No InstallPlan appears after the channel switch.
+
+*Solution*: Confirm the channel name is exactly `support-required-upgrade` and that the catalog offers it: `oc get packagemanifest rhods-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
+
+*Issue*: DSC stays `Not Ready` after the upgrade.
+
+*Solution*: Inspect which component is unhealthy: `oc get dsc default-dsc -o jsonpath='{.status.conditions}' | jq`. The Kueue and Gateway components are the usual suspects -Module 4 covers verifying both.
+
+== Learning outcomes
+
+You've completed the upgrade. You can:
+
+* [x] Switch the subscription to the `{migration-channel}` migration channel
+* [x] Approve the OLM upgrade as it walks to {target-version}
+* [x] Confirm the operator, DSC, and DSCI are healthy on the new version
+* [x] Move the subscription to `{stable-channel}` for ongoing updates
+
+== Module summary
+
+The operator is now on {target-version}, the DSC and DSCI are `Ready`, and the subscription is on the stable channel for future patches. In the final module you'll verify the migrated cluster end to end: the component schema rename, HardwareProfile migration, workbench auth patching, and Gateway API routing.
+
+Continue to *Module 4: Post-upgrade verification*.

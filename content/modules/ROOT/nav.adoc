@@ -1,0 +1,7 @@
+* xref:index.adoc[Workshop Guide]
+* xref:01-overview.adoc[Overview]
+* xref:02-module-01.adoc[Module 1: Assess the cluster]
+* xref:03-module-02.adoc[Module 2: Remediate the blockers]
+* xref:04-module-03.adoc[Module 3: Perform the upgrade]
+* xref:05-module-04.adoc[Module 4: Post-upgrade verification]
+* xref:06-conclusion.adoc[Conclusion]

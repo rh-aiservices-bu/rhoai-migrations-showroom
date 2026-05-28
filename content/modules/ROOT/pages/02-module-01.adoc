@@ -1,0 +1,251 @@
+= Module 1: Assess the cluster
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+Before you change anything, you need to know what the upgrade will break. Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster against a target version and reports every component, workload, and dependency that needs attention.
+
+In this module you'll deploy the assessment tool, run it against your {source-version} cluster targeting {target-version}, and learn to read the results -separating the findings that *block* the upgrade from the ones that are merely advisory.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Deploy and run the `rhai-cli` assessment tool against a live cluster
+* Read a `rhai-cli lint` report and identify blocking versus advisory findings
+* Confirm the current state of the `DataScienceCluster` and its components
+* Understand that a clean assessment is not a workload inventory -you still verify workloads directly
+
+== Exercise 1.1: Confirm the starting state
+
+First, confirm the cluster is on OpenShift AI {source-version} and the platform is healthy.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
+----
+
+[.console-output]
+----
+rhods-operator.2.25.6   Succeeded
+----
+
+Check the `DataScienceCluster` and `DSCInitialization` phases:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='DSC phase: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+DSC phase: Ready
+DSCI phase: Ready
+----
+
+[IMPORTANT]
+====
+If the DSC reports `Not Ready`, the upgrade cannot proceed. Inspect which component is unhealthy with `oc get dsc default-dsc -o jsonpath='{.status.conditions}' | jq` and resolve it before continuing. A common cause is a component whose deployment is stuck -fix the deployment or set that component's `managementState` to `Removed` if it is unused.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.status.phase}{"\n"}'
+----
+
+✓ Output is `Ready`
+
+== Exercise 1.2: Deploy the assessment tool
+
+`rhai-cli` runs from a pod inside the cluster so it can read the OLM CSVs, the DSC/DSCI, and the workload custom resources cluster-wide. Create a project and a pod for it.
+
+[.console-input]
+[source,role="execute"]
+----
+oc new-project rhai-migration
+----
+
+Deploy the `rhai-cli` pod with a small backing volume:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rhai-cli-backup, namespace: rhai-migration }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: rhai-cli, namespace: rhai-migration }
+spec:
+  serviceName: rhai-cli
+  replicas: 1
+  selector: { matchLabels: { app: rhai-cli } }
+  template:
+    metadata: { labels: { app: rhai-cli } }
+    spec:
+      containers:
+        - name: rhai-cli
+          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.2
+          command: ["sh","-c","sleep infinity"]
+          volumeMounts:
+            - { name: backup, mountPath: /tmp/rhoai-upgrade-backup }
+      volumes:
+        - name: backup
+          persistentVolumeClaim: { claimName: rhai-cli-backup }
+EOF
+----
+
+The tool needs to read cluster-scoped resources (OLM CSVs, the DSC/DSCI, operator CRDs), so grant its service account cluster-admin:
+
+[.console-input]
+[source,role="execute"]
+----
+oc create clusterrolebinding rhai-cli-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=rhai-migration:default
+----
+
+=== Verify
+
+Wait for the pod to be running:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n rhai-migration get pod rhai-cli-0
+----
+
+[.console-output]
+----
+NAME         READY   STATUS    RESTARTS   AGE
+rhai-cli-0   1/1     Running   0          30s
+----
+
+✓ Pod status is `Running` and READY shows `1/1`
+
+== Exercise 1.3: Run the assessment
+
+Run the lint against the {target-version} target:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2
+----
+
+The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | IMPACT | MESSAGE`. A trimmed example:
+
+[.console-output]
+----
+STATUS  KIND              CHECK                 IMPACT    MESSAGE
+✗       kserve            serverless-removal    blocking  KServe serverless mode is enabled but will be removed in RHOAI 3.3
+✗       kserve            servicemesh-removal   blocking  ServiceMesh is enabled but is no longer required by RHOAI 3.3
+✗       modelmeshserving  removal               blocking  ModelMesh Serving is enabled but will be removed in RHOAI 3.3
+✗       ray               removal               blocking  CodeFlare is enabled but will be removed in RHOAI 3.3
+⚠       dashboard         hardwareprofile-...   advisory  Found 7 legacy HardwareProfile(s) that will be auto-migrated
+⚠       kserve            impacted-workloads    advisory  inferenceservice-config ConfigMap must have opendatahub.io/managed=false
+⚠       datasciencepi...  renaming              advisory  DataSciencePipelines will be renamed to AIPipelines in DSC v2
+----
+
+You can also save the full report as YAML for the record:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 --output yaml > rhai-cli-output.yaml
+----
+
+=== Reading the results
+
+The `IMPACT` column is what matters:
+
+* *`blocking`* (shown with `✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. You'll handle all of them in Module 2.
+* *`advisory`* (shown with `⚠`) - the migration handles these automatically, or they are informational. You should still understand them, but they do not stop the upgrade.
+
+For this cluster the four blocking findings are the components that 3.x removes: *KServe Serverless mode*, *Service Mesh*, *ModelMesh Serving*, and *CodeFlare*. The advisories tell you what the operator will do for you during the upgrade (HardwareProfile migration, the pipelines rename) plus one ConfigMap you should set yourself to avoid model restarts.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 | grep -E 'blocking|✗'
+----
+
+✓ You see the blocking findings listed (KServe serverless, ServiceMesh, ModelMesh, CodeFlare)
+
+== Exercise 1.4: The assessment is not a workload inventory
+
+A clean or short assessment does not mean an empty cluster. The lint reports components and *incompatible* workloads -it does not list workloads that are already compatible. Confirm what's actually running before you plan the maintenance window.
+
+Check the DSC component states directly:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{range .spec.components | to_entries[]}{.key}: {.value.managementState}{"\n"}{end}' 2>/dev/null \
+  || oc get dsc default-dsc -o json | jq -r '.spec.components | to_entries[] | "\(.key): \(.value.managementState // "(unset)")"'
+----
+
+[.console-output]
+----
+codeflare: Managed
+dashboard: Managed
+datasciencepipelines: Managed
+kserve: Managed
+kueue: Managed
+modelmeshserving: Managed
+ray: Managed
+trainingoperator: Managed
+trustyai: Managed
+workbenches: Managed
+----
+
+Inventory the workbenches and any deployed models -these are what you must account for during the migration even though a compatible workload won't appear as a lint finding:
+
+[.console-input]
+[source,role="execute"]
+----
+echo "Notebooks:"; oc get notebooks -A --no-headers 2>/dev/null | wc -l
+echo "InferenceServices:"; oc get isvc -A --no-headers 2>/dev/null | wc -l
+echo "DataSciencePipelinesApplications:"; oc get dspa -A --no-headers 2>/dev/null | wc -l
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebooks -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name'
+----
+
+✓ You can see the sample workbenches that exist on the cluster
+
+== Learning outcomes
+
+You've now completed the assessment phase. You can:
+
+* [x] Deploy and run the `rhai-cli` assessment tool
+* [x] Distinguish blocking findings (`✗`) from advisory findings (`⚠`)
+* [x] Confirm the DSC and DSCI are `Ready` before starting
+* [x] Inventory workbenches and models directly, because the lint is not an inventory
+
+== Module summary
+
+The cluster has four blocking findings -all of them components that 3.x removes -plus a set of advisories. In the next module you'll resolve every blocker: flipping the removed components to `Removed`, patching the model-serving ConfigMap, stopping the workbenches, and uninstalling the 2.x serving operators.
+
+Continue to *Module 2: Remediate the blockers*.

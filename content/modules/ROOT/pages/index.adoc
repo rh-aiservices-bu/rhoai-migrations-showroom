@@ -1,0 +1,81 @@
+= Migrating Red Hat OpenShift AI 2.25 to 3.3
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+toc::[]
+
+Welcome to the Red Hat OpenShift AI migration workshop. Over the next two hours you will take a running OpenShift AI 2.25 cluster through an in-place migration to 3.3 -assessing it, remediating every upgrade blocker, performing the upgrade itself, and verifying the result.
+
+This is a *migration*, not a routine version bump. Moving from 2.25 to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), and removes several embedded components (Kueue, ModelMesh, CodeFlare, the embedded Service Mesh dependency). You will perform each of those changes by hand so you understand exactly what the operator does and why.
+
+== Prerequisites
+
+This workshop assumes you already have:
+
+* *OpenShift administration skills* - you can work with the `oc` CLI, read and patch custom resources, and understand operators and OLM subscriptions
+* *Familiarity with Red Hat OpenShift AI* - you know what a `DataScienceCluster` (DSC) and `DSCInitialization` (DSCI) are, and roughly what the components do
+* *Comfort reading YAML* - every remediation step inspects or patches a custom resource
+
+*What this workshop does NOT cover*:
+
+* Installing OpenShift AI 2.25 from scratch (your lab cluster already has it)
+* Backup and restore (a real migration requires a verified backup first; that is out of scope here)
+* Rolling back a failed migration
+
+== Accessing your environment
+
+You have been provided with an OpenShift cluster that already runs OpenShift AI {source-version}. Use the following credentials to access it.
+
+=== OpenShift console
+
+* *Console URL:* link:{openshift_console_url}[{openshift_console_url}^]
+* *Username:* {openshift_cluster_admin_username}
+* *Password:* {openshift_cluster_admin_password}
+
+=== OpenShift AI dashboard (pre-upgrade)
+
+Before the upgrade, the dashboard is served from an OpenShift Route:
+
+* *RHOAI URL:* link:https://rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}[https://rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}^]
+
+[NOTE]
+====
+After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You will confirm this change in Module 4.
+====
+
+=== Command line
+
+Use *Terminal 1* in the panel on the right for every command in this workshop. Confirm you are logged in:
+
+[.console-input]
+[source,role="execute"]
+----
+oc whoami
+----
+
+== The starting cluster
+
+Your lab cluster was provisioned with OpenShift AI {source-version} in a pre-migration state -the same shape a customer cluster would be in before they start. It has:
+
+* A `DataScienceCluster` with most components `Managed`
+* A handful of sample workbenches
+* A Data Science Pipelines application
+* Service Mesh 2, OpenShift Serverless, and standalone Authorino installed (the 2.x KServe Serverless stack)
+
+Your job is to get it cleanly onto {target-version}.
+
+== What you'll do
+
+[cols="1,3",options="header"]
+|===
+| Module | What you'll accomplish
+| *Module 1: Assess* | Run the `rhai-cli` assessment tool and learn to read its output -which findings block the upgrade and which are advisory.
+| *Module 2: Remediate* | Resolve every blocker: flip removed components to `Removed`, patch the model-serving ConfigMap, stop workbenches, and uninstall the 2.x serving operators.
+| *Module 3: Upgrade* | Switch the operator subscription to the migration channel, approve the OLM upgrade as it walks to {target-version}, then move to the stable channel.
+| *Module 4: Verify* | Confirm the cluster is healthy on {target-version}: DSC/DSCI Ready, schema changes applied, HardwareProfiles migrated, workbenches patched, and Gateway API serving traffic.
+|===
+
+== Ready to begin?
+
+Open *Terminal 1* in the panel on the right, then navigate to *Module 1* to assess the cluster.
