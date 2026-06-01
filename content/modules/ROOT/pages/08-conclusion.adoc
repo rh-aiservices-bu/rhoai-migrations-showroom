@@ -1,0 +1,50 @@
+= Workshop complete
+:source-highlighter: rouge
+:page-pagination!:
+
+Congratulations -you've migrated a production-shaped Red Hat OpenShift AI {source-version} cluster to {target-version}, carrying live model-serving and workbench workloads across a breaking platform change.
+
+== What you accomplished
+
+You ran the full assessment-driven migration on a cluster that wasn't a clean demo:
+
+* *Assessed* the cluster with `rhai-cli lint`, separated blocking from advisory findings, and learned the assessment is not a workload inventory.
+* *Converted the model-serving workloads* -the hard part: two Serverless ISVCs converted to RawDeployment with backup-and-recreate (the webhook blocks in-place edits), and a ModelMesh model migrated off multi-model serving -*before* disabling the components that hosted them.
+* *Backed up every workload with persistent state* -RayCluster CRs (via the rhai-cli helper), TrustyAI metrics + storage + Guardrails otelExporter config, and the AI Pipelines pre-upgrade DSPA snapshot. The backups are what give you a recovery path if a component drops state during the upgrade. Llama Stack is the exception -its 2→3 transition has no compatible upgrade path, so the action there is delete pre-upgrade and recreate fresh post-upgrade.
+* *Remediated the platform* -disabled the removed components in the correct order, tore down the Service Mesh v2 dependency including the lingering member roll, installed Red Hat Connectivity Link (Service Mesh v3 + Kuadrant + TLS-enabled Authorino) as the 3.x llm-d auth plane, froze the LLMInferenceService templates against the 3.x rewrite, and uninstalled the 2.x operators.
+* *Handled the workbenches* -discovered and retired an orphaned custom image, bumped out-of-date tags, and stopped every workbench.
+* *Upgraded* through the `{migration-channel}` channel to {target-version}, then moved to `{stable-channel}`.
+* *Verified* the result -platform healthy, all four models still serving on RawDeployment through Gateway API (the three you migrated plus the one already on RawDeployment), schema and HardwareProfiles migrated, workbenches patched, RayClusters migrated to KubeRay-only management, KFTO PyTorchJobs / Feast / Model Registry / AI Pipelines all confirmed working, Llama Stack recreated against the new schema, and TrustyAI verified against its pre-upgrade backups.
+
+== Key takeaways
+
+* *Sequencing is everything.* Migrate workloads off a component before you remove the component. Convert Serverless and ModelMesh models first; only then disable those serving modes. Get the order wrong and you lose a running model.
+* *The webhook forces backup-and-recreate.* You cannot change an ISVC's deployment mode in place -back up the spec, delete, and recreate with the new annotation.
+* *The assessment is not an inventory.* A clean lint means no incompatible workloads, not an empty cluster. Always inventory `oc get isvc -A`, ServingRuntimes, and workbench images directly.
+* *Kueue is the highest-risk removal.* Left `Managed` at upgrade time, its admission webhook can reject Job creation cluster-wide. Remove it before the upgrade.
+* *The assessment surfaces additions, not just removals.* The `authorino-tls-readiness`, `kuadrant-readiness`, and `llamastackdistribution / config` findings are 3.x prerequisites that don't exist yet -install RHCL and archive the LSD *before* the upgrade or it stops at those critical findings.
+* *llm-d needs RHCL up before standalone Authorino comes down.* RHCL (Service Mesh v3 + Kuadrant + TLS-enabled Authorino) has to be running so LLMInferenceService doesn't lose auth when you uninstall the standalone Authorino that came in with Serverless.
+* *Llama Stack is delete-and-replace, not upgrade.* The 2.25 → 3.x transition changes the database (SQLite → PostgreSQL), the Vector API, and the Inference API. There is no migration path: delete every LSD before the upgrade and deploy fresh 3.x-shaped ones afterward. If the LSD owner cares about in-pod telemetry / agent state, that's an application-owner archival task outside this workflow.
+* *Back up before you flip.* RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs all have to be captured *before* the destructive flips in Module 3 -especially Ray, because disabling the CodeFlare/Ray component disables the controller that owns the helper script's backup logic. Order: backup → flip, never flip → backup.
+* *Most non-core components survive untouched.* KFTO PyTorchJobs, Feast Feature Stores, Model Registry, and AI Pipelines all continue through the upgrade with no spec changes. They still need verification (and Model Registry needs user comms because the dashboard nav moves) but no migration work.
+* *Both URLs and pods change, intentionally.* External URLs move from Routes to Gateway API, and the 3.x kserve controller rolls each predictor pod onto the newer runtime images (including a newer vLLM) -no separate maintenance window required. Capture the new URLs for downstream consumers and confirm every ISVC recovers to `Ready=True` on the new platform.
+
+== What this workshop did not cover
+
+In a production migration you would also:
+
+* *Take a verified backup first* (etcd snapshot plus OADP) -the only rollback path for an in-place migration.
+* *Rebuild custom workbench images* for kube-rbac-proxy and Gateway API path routing -an application-owner task this lab only identified.
+* *Plan the maintenance window* around stopping workbenches and the brief model-endpoint gap during the routing transition.
+* *Notify downstream consumers* of the new model endpoint URLs before the window.
+
+== References
+
+* link:https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3[Red Hat OpenShift AI 3.3 documentation^]
+* link:https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3/html/managing_resources/introducing-kubernetes-gateway-api_resource-mgmt[Introducing Kubernetes Gateway API in RHOAI 3.x^]
+* link:https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/backup_and_restore/backup-restore-overview[OpenShift Container Platform backup and restore^]
+* link:https://access.redhat.com/articles/7047935[OpenShift AI API tiers (KB 7047935)^]
+
+== Feedback
+
+We'd love to hear how the migration workflow worked for you and where the guidance could be clearer. Share your experience with the workshop team.

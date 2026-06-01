@@ -1,195 +1,133 @@
-= Module 4: Post-upgrade verification
+= Module 4: Handle the workbench images
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-The operator reports {target-version} and the DSC is `Ready`, but the migration isn't finished until you've verified the things that changed during the upgrade and completed the required post-upgrade tasks. In this module you'll confirm the component schema rename, check the HardwareProfile migration, patch the workbenches onto the new auth model, and verify the Gateway API is serving traffic.
+The last thing to handle before the upgrade is the workbenches. RHOAI 3.x changes the workbench authentication model (oauth-proxy to kube-rbac-proxy) and routing (Routes to Gateway API). Out-of-the-box images are bumped by the operator, but *custom* (BYON) images and out-of-date image tags need attention -and you have both on this cluster.
+
+In this module you'll discover the custom image, learn exactly what has to change to make a custom image work in 3.x, swap in a pre-built image that already has those changes, bump out-of-date tags, then stop every workbench so it's ready for the upgrade.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Verify the operator, DSC, and DSCI are healthy on {target-version}
-* Confirm the `datasciencepipelines` to `aipipelines` schema rename and HardwareProfile migration
-* Patch stopped workbenches onto the 3.x kube-rbac-proxy auth model
-* Locate the Gateway API resources and confirm the dashboard's new URL
+* Discover custom (BYON) workbench images registered in the dashboard
+* Describe the Dockerfile and configuration changes a custom image needs for 3.x
+* Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
+* Bump out-of-date image tags and stop every workbench before the upgrade
 
-== Exercise 4.1: Confirm platform health
+== Exercise 4.1: Discover the custom workbench image
 
-Start with the platform-level checks. The CSV should be {target-version} with no 2.x CSV remaining, and both the DSC and DSCI should be `Ready`.
+List the custom (BYON) ImageStreams registered through the dashboard:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
-oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
-oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+oc get imagestream -n redhat-ods-applications -l app.kubernetes.io/created-by=byon \
+  -o custom-columns='NAME:.metadata.name,URL:.metadata.annotations.opendatahub\.io/notebook-image-url'
 ----
 
 [.console-output]
 ----
-rhods-operator.3.3.2   Succeeded
-DSC: Ready
-DSCI: Ready
+NAME                    URL
+custom-scipy-notebook   {legacy-workbench-image}
 ----
 
-Check that the operator-namespace pods are running:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get pods -n redhat-ods-applications --no-headers | grep -v Running | grep -v Completed || echo "all running"
-----
+The image is `{legacy-workbench-image}` -an upstream community Jupyter image, built well before RHOAI 3.x existed. It will not work as-is after the upgrade.
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get co | grep -v "True .* False .* False" | tail -n +2 || echo "all cluster operators healthy"
+oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
+  -o jsonpath='{.spec.tags[0].from.name}{"\n"}'
 ----
 
-✓ DSC and DSCI are `Ready`, the CSV is `rhods-operator.3.3.2`, and cluster operators are healthy
+✓ The ImageStream points at the legacy community image
 
-== Exercise 4.2: Confirm the schema rename
+== Exercise 4.2: Why this image breaks in 3.x
 
-During the 3.x reconciliation the DSC `datasciencepipelines` component is renamed to `aipipelines`. Confirm the new field is present and the old one is gone:
+A custom workbench image built for 2.x makes two assumptions that 3.x breaks:
 
-[.console-input]
-[source,role="execute"]
+. *Authentication.* In 2.x, each workbench pod ran an `oauth-proxy` sidecar tightly coupled to the internal OpenShift OAuth server. In 3.x, the platform injects `kube-rbac-proxy` instead. An image that bakes in oauth-proxy configuration fights the platform and produces redirect loops.
+. *Routing.* In 2.x, workbenches were exposed through OpenShift Routes. In 3.x they're exposed through Kubernetes Gateway API with *path-based* routing, where every workbench lives under a path prefix carried in the `NB_PREFIX` environment variable. An image whose web server ignores `NB_PREFIX` -or strips it from redirects -produces "page not found" once it's behind the Gateway.
+
+The fix is a *rebuild* of the image, not a configuration tweak on the cluster. Red Hat does not auto-rebuild custom images -this is an application-owner task.
+
+== Exercise 4.3: How the image was updated for 3.x
+
+For this workshop the rebuild has already been done for you and pushed to a registry. Before you use it, understand what changed -so you can do the same for your own images.
+
+The 3.x-ready image was produced by rebuilding the original Dockerfile with these changes:
+
+. *Remove the oauth-proxy sidecar and its config.* 3.x injects `kube-rbac-proxy` at the platform level. Any `oauth-proxy` binary, config, or sidecar wiring in the image is deleted -the image only needs to serve the notebook on its own port.
+. *Honor `NB_PREFIX` for all routing.* The notebook server must serve under the path prefix the controller passes in `NB_PREFIX` and must not strip it from redirects. For a Jupyter-based image this means launching with the prefix as the base URL:
++
+[source,dockerfile]
 ----
-oc get dsc default-dsc -o jsonpath='aipipelines={.spec.components.aipipelines.managementState}{"\n"}datasciencepipelines={.spec.components.datasciencepipelines.managementState}{"\n"}'
+# Jupyter respects NB_PREFIX natively when it is used as the base URL.
+# The start script must pass it through, e.g.:
+#   jupyter lab --ServerApp.base_url="${NB_PREFIX}" ...
+# Do NOT hardcode base_url or rewrite redirects without the prefix.
 ----
-
-[.console-output]
+. *Base on a supported UBI9 / Python layer.* Rebuild on a current `registry.redhat.io` UBI9 base compatible with the 3.x notebook controller, rather than the upstream community base.
+. *Tag and push as a new image.* By convention, append `-gw` ("gateway-ready") so the new and old images are distinguishable. This was already done for this lab -shown here for reference only, do not run it:
++
+[source,bash]
 ----
-aipipelines=Managed
-datasciencepipelines=
+podman build -t {gw-workbench-image} -f Dockerfile.gw .
+podman push {gw-workbench-image}
 ----
 
 [NOTE]
 ====
-Any automation that references `.spec.components.datasciencepipelines` must be updated to `.spec.components.aipipelines`. New DSC fields `trainer` and `mlflowoperator` also appear, both defaulting to `Removed`.
+Two NGINX-based images (code-server, RStudio) have well-known `-gw` rebuild bugs worth knowing about:
+
+* A redirect that drops `NB_PREFIX` produces 404s -keep `NB_PREFIX` in every `Location:` header.
+* An `/api` endpoint that returns 403 because of a `SCRIPT_FILENAME` resolution issue -revert `/api` to a 302 redirect rather than an inline rewrite.
+
+Jupyter-based images (like this SciPy notebook) are simpler because Jupyter honors `NB_PREFIX` natively -the main work is removing oauth-proxy and rebasing.
 ====
 
-=== Verify
+The result is published at:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='{.spec.components.aipipelines.managementState}{"\n"}'
+echo "{gw-workbench-image}"
 ----
 
-✓ `aipipelines` is present and `Managed`
-
-== Exercise 4.3: Confirm the HardwareProfile migration
-
-The advisory finding from Module 1 told you the 7 legacy HardwareProfiles would auto-migrate. They move from the `dashboard.opendatahub.io/v1alpha1` API group to `infrastructure.opendatahub.io`, and the objects are *renamed* in the process.
-
-[.console-input]
-[source,role="execute"]
-----
-oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications
-----
-
-[.console-output]
-----
-NAME                              AGE
-containersize-large-notebooks     5m
-containersize-large-serving       5m
-containersize-medium-notebooks    5m
-...
-----
-
-[IMPORTANT]
+[TIP]
 ====
-The objects are renamed (for example `large-notebooks-17kpw` becomes `containersize-large-notebooks`). Any user automation or workbench definition that referenced the old names by hand needs updating.
+The complete source for this rebuilt image -the `Containerfile` and the `NB_PREFIX`-aware entrypoint script -is included in the workshop repository under `examples/custom-workbench-gw/`. Use it as a starting template when you rebuild your own custom images.
 ====
 
-=== Verify
+== Exercise 4.4: Re-register the ImageStream with the 3.x-ready image
+
+Point the custom ImageStream at the rebuilt image so any workbench created from it uses the 3.x-compatible version. Import the new image as a tag:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications --no-headers | wc -l
+oc tag {gw-workbench-image} \
+  custom-scipy-notebook:3.x \
+  -n redhat-ods-applications \
+  --reference-policy=local
 ----
 
-✓ The migrated HardwareProfiles exist in the `infrastructure.opendatahub.io` API group
-
-== Exercise 4.4: Patch the workbenches onto the new auth model
-
-Workbenches still carry the 2.x oauth-proxy configuration. Under 3.x they need kube-rbac-proxy, or they hit redirect loops on first start. The `rhai-cli` helper patches each stopped workbench in place.
-
-Run the helper from the `rhai-cli` pod:
+Update the BYON registration annotation so the dashboard shows the new image URL:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -- bash -c '
-  cd /opt/rhai-upgrade-helpers/workbenches && \
-  ./workbench-2.x-to-3.x-upgrade.sh patch --only-stopped --with-cleanup -y
-'
-----
-
-=== Verify
-
-List the migration status of every workbench:
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -- bash -c '
-  cd /opt/rhai-upgrade-helpers/workbenches && \
-  ./workbench-2.x-to-3.x-upgrade.sh list --all
-'
-----
-
-[.console-output]
-----
-Migration status:
-  Legacy (2.x):     0
-  Migrated (3.x):   5
-OK: All workbenches have been migrated.
-----
-
-✓ All workbenches report `Migrated (3.x)`
-
-== Exercise 4.5: Verify Gateway API routing
-
-RHOAI 3.x routes through Kubernetes Gateway API instead of OpenShift Routes. The dashboard and any model endpoints now resolve through a Gateway. Confirm the GatewayConfig is ready and find the Gateway data-plane.
-
-[.console-input]
-[source,role="execute"]
-----
-oc get gatewayconfigs -A -o wide
-----
-
-[.console-output]
-----
-NAME              READY
-default-gateway   True
-----
-
-The Gateway data-plane pods run in `openshift-ingress`:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get gateway -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,PROGRAMMED:.status.conditions[?(@.type=="Programmed")].status'
-oc get pods -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=data-science-gateway
-----
-
-The dashboard URL has changed -it's now served by the Gateway. Get the new hostname:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.spec.hostname}{"\n"}{end}'
+oc annotate imagestream custom-scipy-notebook -n redhat-ods-applications \
+  opendatahub.io/notebook-image-url="{gw-workbench-image}" --overwrite
 ----
 
 [NOTE]
 ====
-The pre-upgrade dashboard URL (`rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}`) no longer resolves. The new dashboard is at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. Any external consumer of a model endpoint also needs the new Gateway-based URL.
+If the custom image is hosted in the cluster's internal registry, the workbench pod's service account needs `system:image-puller` for the `redhat-ods-applications` namespace. The `--reference-policy=local` flag pins the ImageStream to the local registry so it resolves there rather than re-fetching from the source registry on every pull.
 ====
 
 === Verify
@@ -197,26 +135,78 @@ The pre-upgrade dashboard URL (`rhods-dashboard-redhat-ods-applications.{openshi
 [.console-input]
 [source,role="execute"]
 ----
-oc get gatewayconfig default-gateway -o jsonpath='{.status.phase}{"\n"}' 2>/dev/null \
-  || oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.metadata.name}: ready{"\n"}{end}'
+oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
+  -o jsonpath='{range .status.tags[*]}{.tag}{"\n"}{end}'
 ----
 
-✓ The GatewayConfig is ready and the Gateway data-plane pods are running in `openshift-ingress`
+✓ A `3.x` tag now exists on the `custom-scipy-notebook` ImageStream
 
-== Exercise 4.6: Final assessment
+== Exercise 4.5: Bump out-of-date image tags
 
-Confirm the cluster is clean on {target-version} by re-running the assessment one last time:
+Some out-of-the-box images break on old tags under 3.x. The most common is `code-server`, which must be on the `2025.2` tag. Find any workbench on an older tag:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 | grep -E 'blocking|✗' || echo "No blocking findings -migration complete"
+oc get notebooks -A -o json | jq -r '.items[]
+  | select(.spec.template.spec.containers[0].image | test("code-?server"))
+  | "\(.metadata.namespace)/\(.metadata.name)  \(.spec.template.spec.containers[0].image)"'
 ----
 
-[.console-output]
+If any are on `2025.1` or older, bump them to `2025.2`:
+
+[.console-input]
+[source,role="execute"]
 ----
-No blocking findings -migration complete
+NS=<namespace>; NAME=<notebook>
+oc patch notebook "$NAME" -n "$NS" --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"image-registry.openshift-image-registry.svc:5000/redhat-ods-applications/code-server-notebook:2025.2"}]'
+----
+
+[NOTE]
+====
+RStudio workbenches are built per-cluster from a BuildConfig, must use the `latest` tag, and need a new build *after* the upgrade. Jupyter-based images are generally compatible, but bumping to `2025.2` is recommended.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebooks -A -o json | jq -r '.items[]
+  | select(.spec.template.spec.containers[0].image | test("code-?server"))
+  | "\(.metadata.name): \(.spec.template.spec.containers[0].image | split(":")[-1])"'
+----
+
+✓ Any code-server workbench is on tag `2025.2` (or there are none on this cluster)
+
+== Exercise 4.6: Stop every workbench
+
+All workbenches must be stopped before the upgrade -running workbenches built for the 2.x auth model hit redirect loops during the transition. The notebook controller treats the `kubeflow-resource-stopped` annotation as "stopped if present"; the dashboard sets it to a timestamp, so use one here.
+
+Survey what's running (by pod count, the reliable signal):
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb has $pods pod(s) running"
+done
+----
+
+Stop every workbench:
+
+[.console-input]
+[source,role="execute"]
+----
+STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
+  ns="${row%/*}"; name="${row##*/}"
+  oc -n "$ns" annotate notebook "$name" \
+    kubeflow-resource-stopped="$STAMP" --overwrite
+done
 ----
 
 === Verify
@@ -224,39 +214,46 @@ No blocking findings -migration complete
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='{.status.release.version}{"\n"}'
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb still has $pods pod(s)"
+done
+echo "survey complete"
 ----
 
 [.console-output]
 ----
-3.3.2
+survey complete
 ----
 
-✓ The DSC reports release version `3.3.2`
+✓ No workbench reports running pods
 
 == Troubleshooting
 
-*Issue*: GatewayConfig stuck `Not Ready` and the dashboard URL doesn't resolve.
+*Issue*: `oc tag` reports it can't reach the image.
 
-*Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST gets rejected. Disable the operator-managed NetworkPolicy: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
+*Solution*: Confirm the image URL is correct and public, or that the cluster has a pull secret for the registry. The lab image is published at `{gw-workbench-image}`. If it is in a private registry, add a pull secret to the `redhat-ods-applications` namespace first.
 
-*Issue*: The workbench helper reports `Failed: N`.
+*Issue*: A workbench started from the custom image still hits a redirect loop in 3.x.
 
-*Solution*: Do not force-start those workbenches. Inspect each with `oc describe notebook <name> -n <ns>` and open a support case. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
+*Solution*: The image was not rebuilt correctly -confirm oauth-proxy is fully removed and the server honors `NB_PREFIX`. Use the rebuilt `-gw` image from Exercise 4.4, not the original.
 
-*Issue*: `KueueReady=False` after upgrade.
+*Issue*: A workbench won't stop -its pod keeps coming back.
 
-*Solution*: If the message says `managementState Managed is not supported`, the pre-upgrade Kueue step was missed. Re-apply it: `oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{"spec":{"components":{"kueue":{"managementState":"Removed"}}}}'`.
+*Solution*: Confirm the annotation applied: `oc get notebook <name> -n <ns> -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}'`. The controller treats *any* non-empty value as stopped -use a timestamp, not the literal `true`.
 
 == Learning outcomes
 
-You've completed the verification phase and the migration. You can:
+You've completed the workbench phase. You can:
 
-* [x] Verify the operator, DSC, and DSCI are healthy on {target-version}
-* [x] Confirm the `aipipelines` rename and the HardwareProfile migration
-* [x] Patch workbenches onto the 3.x auth model
-* [x] Locate the Gateway API resources and the new dashboard URL
+* [x] Discover BYON ImageStreams registered in the dashboard
+* [x] Describe the Dockerfile and config changes a custom image needs for 3.x
+* [x] Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
+* [x] Bump out-of-date tags and stop every workbench before the upgrade
 
 == Module summary
 
-The cluster is fully migrated to {target-version}: the platform is healthy, the schema and HardwareProfiles have migrated, workbenches are patched onto the new auth model, and Gateway API is serving traffic. Continue to the *Conclusion* to review what you accomplished.
+The workbenches are handled: the custom image is re-registered to a 3.x-ready build, out-of-date tags are bumped, and every workbench is stopped. The cluster is fully pre-upgrade-clean -models converted, components removed, operators gone, images updated, workbenches stopped. It's time to upgrade.
+
+Continue to *Module 5: Perform the upgrade*.

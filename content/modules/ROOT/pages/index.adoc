@@ -5,17 +5,17 @@
 
 toc::[]
 
-Welcome to the Red Hat OpenShift AI migration workshop. Over the next two hours you will take a running OpenShift AI 2.25 cluster through an in-place migration to 3.3 -assessing it, remediating every upgrade blocker, performing the upgrade itself, and verifying the result.
+Welcome to the Red Hat OpenShift AI migration workshop. You'll take a *production-shaped* OpenShift AI 2.25 cluster through an in-place migration to 3.3 -and unlike a clean demo cluster, this one has real workloads that don't survive a naive upgrade.
 
-This is a *migration*, not a routine version bump. Moving from 2.25 to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), and removes several embedded components (Kueue, ModelMesh, CodeFlare, the embedded Service Mesh dependency). You will perform each of those changes by hand so you understand exactly what the operator does and why.
+This is a *migration*, not a routine version bump. Moving from 2.25 to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), and *removes* several components your workloads currently depend on: Serverless model serving, ModelMesh, embedded Kueue, and CodeFlare. You can't just disable those components -you have to migrate the workloads off them first, in the right order, or you lose running models.
 
 == Prerequisites
 
 This workshop assumes you already have:
 
 * *OpenShift administration skills* - you can work with the `oc` CLI, read and patch custom resources, and understand operators and OLM subscriptions
-* *Familiarity with Red Hat OpenShift AI* - you know what a `DataScienceCluster` (DSC) and `DSCInitialization` (DSCI) are, and roughly what the components do
-* *Comfort reading YAML* - every remediation step inspects or patches a custom resource
+* *Familiarity with Red Hat OpenShift AI* - you know what a `DataScienceCluster` (DSC) and `DSCInitialization` (DSCI) are, what an `InferenceService` (ISVC) and `ServingRuntime` are, and roughly what the components do
+* *Comfort reading and editing YAML* - several steps back up, edit, and recreate custom resources
 
 *What this workshop does NOT cover*:
 
@@ -41,7 +41,7 @@ Before the upgrade, the dashboard is served from an OpenShift Route:
 
 [NOTE]
 ====
-After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You will confirm this change in Module 4.
+After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You'll confirm this -and the matching change to model endpoint URLs -in Module 6.
 ====
 
 === Command line
@@ -56,24 +56,27 @@ oc whoami
 
 == The starting cluster
 
-Your lab cluster was provisioned with OpenShift AI {source-version} in a pre-migration state -the same shape a customer cluster would be in before they start. It has:
+Your lab cluster was provisioned with OpenShift AI {source-version} in a realistic, messy pre-migration state. The DSC is `Ready` and the cluster is healthy -but it carries workloads that the 3.x removals would break:
 
-* A `DataScienceCluster` with most components `Managed`
-* A handful of sample workbenches
-* A Data Science Pipelines application
-* Service Mesh 2, OpenShift Serverless, and standalone Authorino installed (the 2.x KServe Serverless stack)
+* *Serverless model-serving ISVCs* in `ml-project-a` and `ml-project-b` -running on KServe Serverless mode, which 3.x removes
+* *A ModelMesh model* in `ml-project-c` -multi-model serving, which 3.x removes entirely
+* *A custom (BYON) workbench image* registered in the dashboard -built for the 2.x auth model
+* *Sample workbenches and a Data Science Pipelines application*
+* The 2.x serving stack: Service Mesh 2, OpenShift Serverless, and standalone Authorino
 
-Your job is to get it cleanly onto {target-version}.
+Your job is to carry all of it cleanly onto {target-version}.
 
 == What you'll do
 
 [cols="1,3",options="header"]
 |===
 | Module | What you'll accomplish
-| *Module 1: Assess* | Run the `rhai-cli` assessment tool and learn to read its output -which findings block the upgrade and which are advisory.
-| *Module 2: Remediate* | Resolve every blocker: flip removed components to `Removed`, patch the model-serving ConfigMap, stop workbenches, and uninstall the 2.x serving operators.
-| *Module 3: Upgrade* | Switch the operator subscription to the migration channel, approve the OLM upgrade as it walks to {target-version}, then move to the stable channel.
-| *Module 4: Verify* | Confirm the cluster is healthy on {target-version}: DSC/DSCI Ready, schema changes applied, HardwareProfiles migrated, workbenches patched, and Gateway API serving traffic.
+| *Module 1: Assess* | Run the `rhai-cli` assessment, read its findings, and learn why a clean lint is not a workload inventory.
+| *Module 2: Convert serving* | Convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe -*before* the components that host them are removed.
+| *Module 3: Remediate platform* | Flip the removed components to `Removed`, patch the model-serving ConfigMap, remove the Service Mesh dependency, and uninstall the 2.x operators.
+| *Module 4: Workbench images* | Discover the custom workbench image, learn what a custom image needs to change for 3.x, re-register it to a rebuilt image, bump out-of-date tags, and stop every workbench.
+| *Module 5: Upgrade* | Switch to the migration channel, drive the OLM upgrade to {target-version}, then move to the stable channel.
+| *Module 6: Verify* | Confirm the platform is healthy, the converted models still serve, the schema and HardwareProfiles migrated, and workbenches are patched onto the new auth model.
 |===
 
 == Ready to begin?

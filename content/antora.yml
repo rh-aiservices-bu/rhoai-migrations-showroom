@@ -11,9 +11,14 @@ asciidoc:
     release-version: master
     page-pagination: '@'
     source-version: "2.25"
-    target-version: "3.3.2"
+    target-version: "3.3.3"
     migration-channel: "support-required-upgrade"
     stable-channel: "stable-3.3"
+    # Custom workbench images used in Module 4. Build + push instructions are in
+    # examples/README.md. TODO: replace these placeholders with your real quay.io URLs
+    # once the images are pushed.
+    legacy-workbench-image: "quay.io/PLACEHOLDER-ORG/rhoai-workbench-2x:lab-4.2.5"
+    gw-workbench-image:     "quay.io/PLACEHOLDER-ORG/rhoai-workbench-gw:3.x"
     openshift_cluster_ingress_domain: PLACEHOLDER-URL.com
     openshift_console_url: OCP-PLACEHOLDER-URL.com
     openshift_cluster_admin_username: admin

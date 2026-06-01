@@ -1,53 +1,64 @@
-= Module 3: Perform the upgrade
+= Module 3: Remediate the platform
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-The cluster is pre-upgrade-clean. Now you'll trigger the actual migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to {target-version}.
+With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path, so the action is delete pre-upgrade and recreate fresh post-upgrade (data archival is out of scope here). This module starts with backups, deletes the LSDs, then runs the disables, then the 3.x prerequisites, then operator uninstalls.
 
-The migration channel is intentionally separate from the normal release channels so the upgrade can't be triggered by accident. You'll see OLM walk the upgrade graph one release at a time, and you'll approve each step. When it's done, you'll move the subscription onto the stable channel so the cluster receives ongoing patch updates.
+In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 6, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, install Red Hat Connectivity Link (RHCL) as the 3.x llm-d auth plane, freeze the LLMInferenceService templates, and finally uninstall the 2.x serving operators.
+
+The model-serving pods *will* restart during the upgrade -that's deliberate. Letting the 3.x kserve controller reconcile them picks up the newer kserve and runtime images (including a newer vLLM) without a separate maintenance window. If your environment cannot tolerate a brief restart, the `inferenceservice-config` ConfigMap can be marked unmanaged before the upgrade to suppress this; that path isn't covered here.
+
+Order matters throughout. Back up RayClusters *before* disabling Ray. KServe Serverless must drain before you remove the Service Mesh v2 dependency. The Service Mesh member roll has to be deleted before its operator can be uninstalled. And RHCL must be up *before* you uninstall the standalone Authorino, or LLMInferenceService loses auth for the duration of the window.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Switch the operator subscription to the `{migration-channel}` migration channel
-* Approve the OLM InstallPlans as the upgrade walks to {target-version}
-* Confirm the operator and DSC reach a healthy state on the new version
-* Move the subscription to the `{stable-channel}` channel for ongoing updates
+* Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs ahead of destructive component changes, and delete any LlamaStackDistributions
+* Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`
+* Remove the Service Mesh v2 dependency including the lingering member roll
+* Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
+* Freeze the LLMInferenceService scheduler/router templates against the 3.x rewrite
+* Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
 
-== Exercise 3.1: Inspect the current subscription
+== Exercise 3.1: Back up the RayClusters
 
-Look at where the subscription points today. The approval mode is `Manual`, which is what you want -it forces you to approve each step rather than auto-upgrading.
+The `codeflare` operator is removed in 3.x; KubeRay takes over Ray cluster management directly. Existing RayCluster CRs survive the controller swap, but the migration guide is explicit: capture each one to disk first, in case reconciliation drops fields.
 
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-operator get subscription rhods-operator \
-  -o jsonpath='channel={.spec.channel}{"\n"}approval={.spec.installPlanApproval}{"\n"}installedCSV={.status.installedCSV}{"\n"}'
-----
+You *must* do this before Exercise 3.6 (Disable Ray + CodeFlare). The pre-upgrade helper expects CodeFlare to still be installed.
 
-[.console-output]
-----
-channel=stable-2.25
-approval=Manual
-installedCSV=rhods-operator.2.25.6
-----
-
-See which channels the catalog offers. `{migration-channel}` is the one that triggers the 2 to 3 migration:
+Enumerate first:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get packagemanifest rhods-operator -n openshift-marketplace \
-  -o jsonpath='{range .status.channels[*]}{.name}  {.currentCSV}{"\n"}{end}' | grep -E 'support-required-upgrade|stable-3'
+oc get raycluster -A
 ----
 
 [.console-output]
 ----
-stable-3.3                 rhods-operator.3.3.2
-stable-3.x                 rhods-operator.3.4.0
-support-required-upgrade   rhods-operator.3.3.2
+NAMESPACE   NAME                  DESIRED WORKERS   AVAILABLE WORKERS   STATUS   AGE
+raytest     comprehensive-mixed   2                 2                   ready    2h
+raytest     sdk-configurations    1                 1                   ready    2h
+----
+
+Run the rhai-cli pre-upgrade helper. It writes each RayCluster CR to two locations -the 2.x shape and the 3.x equivalent -and then uninstalls the CodeFlare Operator as a side effect:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py pre-upgrade
+----
+
+Copy the backup off the rhai-cli pod:
+
+[.console-input]
+[source,role="execute"]
+----
+oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/ray ./ray-backup
+ls -la ./ray-backup/
 ----
 
 === Verify
@@ -55,30 +66,179 @@ support-required-upgrade   rhods-operator.3.3.2
 [.console-input]
 [source,role="execute"]
 ----
-oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='{.spec.installPlanApproval}{"\n"}'
+oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ray/Rhoai-2.x/
+oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ray/Rhoai-3.x/
+oc get raycluster -A
 ----
 
-✓ Output is `Manual` -InstallPlans will wait for your approval
+✓ Both backup directories list one file per RayCluster, and the RayClusters themselves are still `ready` and serving
 
-== Exercise 3.2: Switch to the migration channel
+== Exercise 3.2: Back up TrustyAI metrics and data
 
-Point the subscription at the migration channel:
+TrustyAI's storage schema changed between 2.x and 3.x. Historical bias-detection metrics and training data can become unreadable without a pre-upgrade snapshot. Capture both before anything else touches the component.
+
+Confirm TrustyAI is `Managed` (skip the rest of this exercise if not):
 
 [.console-input]
 [source,role="execute"]
 ----
-oc -n redhat-ods-operator patch subscription rhods-operator --type=merge -p '{
-  "spec": { "channel": "support-required-upgrade" }
+oc get dsc default-dsc -o jsonpath='trustyai={.spec.components.trustyai.managementState}{"\n"}'
+oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STORAGE:.spec.storage.format'
+----
+
+Run the metrics + storage backup helpers (the storage helper auto-detects PVC vs DATABASE-backed services):
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- mkdir -p /tmp/rhoai-upgrade-backup/trustyai
+oc exec -n rhai-migration rhai-cli-0 -- bash /opt/rhai-upgrade-helpers/trustyai/backup_metrics.sh
+oc exec -n rhai-migration rhai-cli-0 -- bash /opt/rhai-upgrade-helpers/trustyai/backup_storage.sh
+----
+
+If you have `GuardrailsOrchestrator` CRs with `spec.otelExporter` set, capture the block so you can restore it post-upgrade:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get guardrailsorchestrator -A -o json \
+  | jq -r '.items[] | select(.spec.otelExporter != null) | {ns: .metadata.namespace, name: .metadata.name, otelExporter: .spec.otelExporter}' \
+  > /tmp/trustyai-guardrails-otel-backup-$(date +%Y%m%d%H%M).json
+----
+
+Copy the backup off the rhai-cli pod:
+
+[.console-input]
+[source,role="execute"]
+----
+oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/trustyai ./trustyai-backup
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- ls -la /tmp/rhoai-upgrade-backup/trustyai
+----
+
+✓ The backup directory lists at least one `trustyai-metrics-*.json` and one `trustyai-data-*` (PVC format) or `trustyai-db-*` (DATABASE format) entry per TrustyAIService
+
+== Exercise 3.3: AI Pipelines pre-upgrade check
+
+DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and 3.3 -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. The rhai-cli helper enumerates every issue.
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  bash /opt/rhai-upgrade-helpers/ai_pipelines/check_before_upgrade.sh
+----
+
+Possible outcomes:
+
+* **OK** → no action; the helper also writes a pre-upgrade pods snapshot to `/tmp/rhoai-upgrade-backup/ai_pipelines/` which `post_upgrade_check.sh` will diff against in Module 6.
+* **Warning: deprecated `instructLab` field** → safe to ignore; the field is tolerated during upgrade.
+* **Deprecated v1alpha1 DSPA found** → patch each CR to `apiVersion: …/v1` and `spec.dspVersion: v2`, then patch the CRD's `.status.storedVersions` to remove `v1alpha1`.
+* **Custom RBAC roles detected (ArgoCD-managed)** → advisory only; leave as-is or update the GitOps source.
+
+If the helper flags `v1alpha1` DSPAs, the patch loop is:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get crd datasciencepipelinesapplications.datasciencepipelinesapplications.opendatahub.io \
+  -o jsonpath='{.status.storedVersions}'; echo
+# If you see ["v1alpha1","v1"] and every DSPA is now v1:
+# oc patch crd datasciencepipelinesapplications.datasciencepipelinesapplications.opendatahub.io \
+#   --subresource=status --type=merge -p '{"status":{"storedVersions":["v1"]}}'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dspa -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,API:.apiVersion,DSP:.spec.dspVersion'
+oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ai_pipelines/
+----
+
+✓ Every DSPA is at `apiVersion: …/v1`, `DSP=v2`, and the pre-upgrade pods snapshot file exists
+
+== Exercise 3.4: Delete any Llama Stack distributions
+
+Llama Stack's 2→3 transition is "delete and replace." The schema changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. Archiving the in-pod data is out of scope for this workshop; if your LSD owner cares about telemetry/agent state, that's a separate conversation. For the migration itself, the action is just *delete*.
+
+If no LSDs are present, this exercise is a no-op. If any exist, delete them so the upgrade has a clean slate and the `llamastackdistribution / config` blocker clears:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llamastackdistribution -A
+oc get llamastackdistribution -A -o json \
+  | jq -r '.items[]? | "\(.metadata.namespace) \(.metadata.name)"' \
+  | while read NS NAME; do oc delete llamastackdistribution "$NAME" -n "$NS"; done
+----
+
+You'll deploy a fresh 3.x-shaped LSD in Module 6.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llamastackdistribution -A 2>&1 | tail -1
+----
+
+[.console-output]
+----
+No resources found
+----
+
+✓ All LSDs are deleted -the rhai-cli `llamastackdistribution / config` blocker is cleared
+
+== Exercise 3.5: Disable Kueue
+
+RHOAI 2.25 deprecated the embedded Kueue distribution; 3.3 removes it. Leaving Kueue `Managed` at upgrade time is the highest-risk mistake in the whole migration: the Kueue admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster.
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kueue": { "managementState": "Removed" } } }
 }'
 ----
 
-OLM now generates an InstallPlan. Confirm one appears (unapproved):
+=== Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc -n redhat-ods-operator get installplan \
-  -o custom-columns='NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[0],APPROVED:.spec.approved'
+oc get dsc default-dsc -o jsonpath='kueue: {.spec.components.kueue.managementState}{"\n"}'
+oc get dsc default-dsc -o jsonpath='{range .status.conditions[?(@.type=="KueueReady")]}{.status} {.reason}{"\n"}{end}'
+----
+
+[.console-output]
+----
+kueue: Removed
+False Removed
+----
+
+✓ `kueue` is `Removed`. `KueueReady=False` with reason `Removed` is expected
+
+== Exercise 3.6: Disable Ray and CodeFlare
+
+3.x drops the CodeFlare operator; KubeRay continues to manage Ray clusters directly. The DSC has *two* separate components, `codeflare` and `ray`, even though the assessment reports the blocker under `ray/removal`. Flip both:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": {
+    "codeflare": { "managementState": "Removed" },
+    "ray":       { "managementState": "Removed" }
+  } }
+}'
 ----
 
 === Verify
@@ -86,56 +246,26 @@ oc -n redhat-ods-operator get installplan \
 [.console-input]
 [source,role="execute"]
 ----
-oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='channel={.spec.channel}{"\n"}'
+oc get dsc default-dsc -o jsonpath='ray={.spec.components.ray.managementState} codeflare={.spec.components.codeflare.managementState}{"\n"}'
 ----
 
 [.console-output]
 ----
-channel=support-required-upgrade
+ray=Removed codeflare=Removed
 ----
 
-✓ The subscription is on the migration channel and an unapproved InstallPlan exists
+✓ Both `ray` and `codeflare` are `Removed`
 
-== Exercise 3.3: Approve the upgrade
+== Exercise 3.7: Disable ModelMesh Serving
 
-[IMPORTANT]
-====
-OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.6` you'll see *one* InstallPlan (`2.25.6` to `3.3.2`). From a cluster on an earlier 2.25 patch you may see *two* in sequence (for example `2.25.5` to `2.25.6`, then `2.25.6` to `3.3.2`). Each requires its own approval because the channel uses Manual approval.
-====
-
-This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
+You migrated the ModelMesh model in Module 2, so it's safe to remove the component now:
 
 [.console-input]
 [source,role="execute"]
 ----
-deadline=$(( $(date +%s) + 1800 ))
-while (( $(date +%s) < deadline )); do
-  IP=$(oc -n redhat-ods-operator get installplan -o json \
-    | jq -r '.items[] | select(.spec.approved==false) | .metadata.name' | head -1)
-  if [ -n "$IP" ]; then
-    echo "Approving InstallPlan $IP ..."
-    oc -n redhat-ods-operator patch installplan "$IP" --type=merge -p '{"spec":{"approved":true}}'
-    sleep 30
-    continue
-  fi
-  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.2 -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo "rhods-operator.3.3.2 phase: ${phase:-<pending>}"
-  [ "$phase" = "Succeeded" ] && break
-  sleep 30
-done
-----
-
-This runs for several minutes as OLM installs each release. When it exits, check the CSV:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get csv -n redhat-ods-operator | grep rhods-operator
-----
-
-[.console-output]
-----
-rhods-operator.3.3.2   Red Hat OpenShift AI   3.3.2   rhods-operator.2.25.6   Succeeded
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "modelmeshserving": { "managementState": "Removed" } } }
+}'
 ----
 
 === Verify
@@ -143,26 +273,94 @@ rhods-operator.3.3.2   Red Hat OpenShift AI   3.3.2   rhods-operator.2.25.6   Su
 [.console-input]
 [source,role="execute"]
 ----
-oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayName=="Red Hat OpenShift AI")]}{.metadata.name} {.status.phase}{"\n"}{end}'
-----
-
-✓ `rhods-operator.3.3.2` is `Succeeded` and no `rhods-operator.2.*` CSV remains
-
-== Exercise 3.4: Wait for the DSC and DSCI to settle
-
-The new operator reconciles the DSC and DSCI under the 3.x model. Wait for both to return to `Ready`:
-
-[.console-input]
-[source,role="execute"]
-----
-oc wait --for=jsonpath='{.status.phase}'=Ready dsc/default-dsc --timeout=20m
-oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
+oc get dsc default-dsc -o jsonpath='modelmeshserving: {.spec.components.modelmeshserving.managementState}{"\n"}'
+oc get pods -n redhat-ods-applications -l control-plane=modelmesh-controller --no-headers 2>/dev/null | wc -l
 ----
 
 [.console-output]
 ----
-datasciencecluster.datasciencecluster.opendatahub.io/default-dsc condition met
-DSCI phase: Ready
+modelmeshserving: Removed
+0
+----
+
+✓ `modelmeshserving` is `Removed` and its controller pods are gone
+
+== Exercise 3.8: Disable KServe Serverless mode
+
+You converted both Serverless ISVCs in Module 2, so disabling Serverless mode no longer affects a running model. Set `serving` to `Removed` and the default mode to `RawDeployment`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kserve": {
+    "serving": { "managementState": "Removed" },
+    "defaultDeploymentMode": "RawDeployment"
+  } } }
+}'
+----
+
+This tears down the Knative stack -several minutes. Watch it drain:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get knativeserving -A
+----
+
+Re-run until it reports `No resources found`.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='serving={.spec.components.kserve.serving.managementState} mode={.spec.components.kserve.defaultDeploymentMode}{"\n"}'
+oc get knativeserving -A 2>&1 | tail -1
+----
+
+[.console-output]
+----
+serving=Removed mode=RawDeployment
+No resources found
+----
+
+Confirm all four models are still serving through the teardown:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+----
+
+✓ `serving=Removed`, Knative drained, and all four RawDeployment models are still `READY=True`
+
+== Exercise 3.9: Remove the Service Mesh dependency
+
+OpenShift 4.19+ handles service mesh internally, so RHOAI 3.x no longer needs the embedded Service Mesh. Set the DSCI `serviceMesh` to `Removed`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch dsci default-dsci --type=merge -p '{
+  "spec": { "serviceMesh": { "managementState": "Removed" } }
+}'
+----
+
+Wait for the ServiceMeshControlPlane to drain:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get smcp -A
+----
+
+Re-run until it reports `No resources found`. Then delete the leftover ServiceMeshMemberRoll -the DSCI change drains the SMCP but does *not* delete the member roll, which lingers with a `maistra.io/istio-operator` finalizer. Delete it while the Service Mesh operator is still installed to process the finalizer:
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete smmr default -n istio-system --ignore-not-found
 ----
 
 === Verify
@@ -170,33 +368,177 @@ DSCI phase: Ready
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
-oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='serviceMesh: {.spec.serviceMesh.managementState}{"\n"}'
+oc get smcp,smmr -A 2>&1 | tail -2
 ----
 
 [.console-output]
 ----
-DSC: Ready
-DSCI: Ready
+serviceMesh: Removed
+No resources found
 ----
 
-✓ Both the DSC and DSCI are `Ready` under {target-version}
+✓ `serviceMesh` is `Removed` and both the SMCP and SMMR are gone
 
-== Exercise 3.5: Move off the migration channel
+== Exercise 3.10: Install Red Hat Connectivity Link for llm-d
 
-The `{migration-channel}` channel is a one-shot trigger -it does not advance to later 3.3.x patch releases. Leaving the subscription there means the cluster gets no ongoing z-stream updates. Move it to the stable 3.3 channel:
+RHOAI 3.x routes LLMInferenceService (llm-d) traffic through Kubernetes Gateway API with *Red Hat Connectivity Link* (RHCL -upstream: Kuadrant) as the consolidated auth/policy plane. RHCL replaces the standalone Authorino that came in with the Serverless stack.
+
+Install RHCL *before* uninstalling the standalone Authorino (Exercise 3.12), or you'll drop auth for any LLMInferenceService for the duration of the window.
+
+=== Sub-step A: Install the RHCL operator
+
+The RHCL operator installs into the `kuadrant-system` namespace with **install mode "A specific namespace on the cluster"** (single-namespace) -*not* AllNamespaces / `openshift-operators`. The OperatorHub UI creates the namespace if it doesn't exist; the equivalent `oc apply` form:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc patch subscription rhods-operator -n redhat-ods-operator --type=merge -p '{
-  "spec": { "channel": "stable-3.3" }
+oc create ns kuadrant-system 2>/dev/null || true
+
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata: { name: kuadrant-system, namespace: kuadrant-system }
+spec:
+  targetNamespaces:
+    - kuadrant-system
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata: { name: rhcl-operator, namespace: kuadrant-system }
+spec:
+  channel: stable
+  name: rhcl-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+----
+
+Wait for the RHCL CSV in `kuadrant-system` to reach `Succeeded`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n kuadrant-system | grep rhcl
+----
+
+Re-run until you see `Succeeded`.
+
+=== Sub-step B: Create the Kuadrant CR and enable TLS on Authorino
+
+Create the Kuadrant CR. RHCL provisions Authorino and Limitador in response:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata: { name: kuadrant, namespace: kuadrant-system }
+EOF
+
+oc wait Kuadrant -n kuadrant-system kuadrant --for=condition=Ready --timeout=10m
+----
+
+Annotate the Authorino service so OpenShift's built-in service signer issues the listener cert (no cert-manager involved -OCP's internal CA mints `authorino-server-cert` automatically):
+
+[.console-input]
+[source,role="execute"]
+----
+oc annotate svc/authorino-authorino-authorization \
+  service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+  -n kuadrant-system
+
+sleep 2
+----
+
+Apply the Authorino CR with TLS on the **listener only** -the migration guide explicitly leaves `oidcServer.tls.enabled` *off*:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: operator.authorino.kuadrant.io/v1beta1
+kind: Authorino
+metadata:
+  name: authorino
+  namespace: kuadrant-system
+spec:
+  replicas: 1
+  clusterWide: true
+  listener:
+    tls:
+      enabled: true
+      certSecretRef:
+        name: authorino-server-cert
+  oidcServer:
+    tls:
+      enabled: false
+EOF
+
+oc wait --for=condition=ready pod -l authorino-resource=authorino -n kuadrant-system --timeout=150s
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n kuadrant-system | grep rhcl
+oc get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.status.conditions}' | jq
+oc get authorino authorino -n kuadrant-system -o jsonpath='listener-tls={.spec.listener.tls.enabled}{"\n"}'
+oc get pods -n kuadrant-system -l authorino-resource=authorino
+----
+
+Expect: RHCL CSV `Succeeded`, Kuadrant condition `Ready=True` with message `Kuadrant is ready`, `listener-tls=true`, Authorino pods `Running 1/1`.
+
+✓ RHCL is installed, Kuadrant is `Ready`, Authorino has TLS on the listener -the `kuadrant-readiness` and `authorino-tls-readiness` blockers are cleared
+
+== Exercise 3.11: Freeze the LLMInferenceService template annotations
+
+The 3.x upgrade rewrites the llm-d scheduler/router templates in the `inferenceservice-config` ConfigMap. If an LLMInferenceService is implicitly using the 2.25 template defaults, the rewrite can leave its scheduler dropping pods after the upgrade. Pin the template names on the LLMInferenceService's `.status.annotations` to freeze the 2.25 behaviour across the upgrade.
+
+The pins go on the `status` subresource, *not* `metadata.annotations` -that's where the 2.25 scheduler reads them.
+
+Enumerate the LLMInferenceServices:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llminferenceservice -A
+----
+
+[.console-output]
+----
+NAMESPACE       NAME           URL   READY   REASON                       AGE
+llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
+----
+
+Apply the eight template pins to each LLMInferenceService (`llmisvc` is the short kind name):
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch llmisvc my-llm-model -n llm-project-a --subresource=status --type=merge -p '{
+  "status": {
+    "annotations": {
+      "serving.kserve.io/config-llm-template":                        "kserve-config-llm-template",
+      "serving.kserve.io/config-llm-decode-template":                 "kserve-config-llm-decode-template",
+      "serving.kserve.io/config-llm-worker-data-parallel":            "kserve-config-llm-worker-data-parallel",
+      "serving.kserve.io/config-llm-decode-worker-data-parallel":     "kserve-config-llm-decode-worker-data-parallel",
+      "serving.kserve.io/config-llm-prefill-template":                "kserve-config-llm-prefill-template",
+      "serving.kserve.io/config-llm-prefill-worker-data-parallel":    "kserve-config-llm-prefill-worker-data-parallel",
+      "serving.kserve.io/config-llm-scheduler":                       "kserve-config-llm-scheduler",
+      "serving.kserve.io/config-llm-router-route":                    "kserve-config-llm-router-route"
+    }
+  }
 }'
 ----
 
 [NOTE]
 ====
-Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (which would eventually offer a 3.4 minor upgrade -a separate planning decision, not a patch).
+On this cluster `my-llm-model` is `Ready=False` -that's a model-level health issue (typically a missing GPU resource or model artifact), not a migration concern. The template freeze applies regardless of whether the workload is currently serving; it pins the scheduler's behaviour for after the upgrade.
 ====
 
 === Verify
@@ -204,42 +546,120 @@ Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (
 [.console-input]
 [source,role="execute"]
 ----
-oc get subscription rhods-operator -n redhat-ods-operator \
-  -o jsonpath='channel={.spec.channel}  state={.status.state}  installedCSV={.status.installedCSV}{"\n"}'
+oc get llmisvc my-llm-model -n llm-project-a -o jsonpath='{.status.annotations}' | jq 'to_entries | map(select(.key | startswith("serving.kserve.io/config-llm-"))) | length'
 ----
 
 [.console-output]
 ----
-channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.2
+8
 ----
 
-✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.2`
+✓ All eight `serving.kserve.io/config-llm-*` annotations are pinned on the LLMInferenceService
+
+== Exercise 3.12: Uninstall the 2.x serving operators
+
+OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies of the 2.x KServe Serverless stack. With that stack removed -and RHCL up to take over auth -uninstall them.
+
+[.console-input]
+[source,role="execute"]
+----
+# Standalone Authorino (came in with Serverless) - capture the installedCSV first so we
+# only delete the CSV the standalone subscription installed, not the RHCL-bundled one
+AUTH_CSV=$(oc -n openshift-operators get subscription authorino-operator -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
+[ -n "$AUTH_CSV" ] && oc -n openshift-operators delete csv "$AUTH_CSV" --ignore-not-found
+
+# OpenShift Serverless
+oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+
+# Service Mesh 2 (safe now that the SMCP and SMMR are gone)
+oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+----
+
+[IMPORTANT]
+====
+The Authorino cleanup is surgical -it deletes *only* the CSV that the standalone `authorino-operator` subscription installed. The Authorino CR provisioned by RHCL in `kuadrant-system` (which you set up in Exercise 3.10) is unaffected and continues to serve auth for LLMInferenceService.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
+echo "--- check complete ---"
+----
+
+[.console-output]
+----
+--- check complete ---
+----
+
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
+
+== Exercise 3.13: Re-run the assessment
+
+Re-run the lint -all seven of the original blocking/critical findings should now be gone:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -E 'blocking|✗' || echo "No blocking findings remain"
+----
+
+[.console-output]
+----
+No blocking findings remain
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.status.phase}{"\n"}'
+----
+
+✓ DSC is still `Ready` and the assessment reports no blocking findings
 
 == Troubleshooting
 
-*Issue*: The approval loop times out without reaching `Succeeded`.
+*Issue*: `oc delete smmr` hangs.
 
-*Solution*: Check the operator logs with `oc logs -n redhat-ods-operator deploy/rhods-operator --tail=50`. A stuck InstallPlan usually means a removed component was left `Managed` -re-run the Module 1 assessment to find which one, fix it, and the upgrade resumes.
+*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Delete the SMMR *before* uninstalling the operator in Exercise 3.12. If you already uninstalled it, reinstall it briefly so the finalizer can process, then delete the SMMR.
 
-*Issue*: No InstallPlan appears after the channel switch.
+*Issue*: Kuadrant CR is stuck at `Ready=False` with `MissingDependency` for a Gateway API provider.
 
-*Solution*: Confirm the channel name is exactly `support-required-upgrade` and that the catalog offers it: `oc get packagemanifest rhods-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
+*Solution*: On a clean OCP 4.20+ cluster the Cluster Ingress Operator installs and manages `servicemeshoperator3` as the Gateway API provider -confirm with `oc get csv -n openshift-operators | grep servicemeshoperator3` (expect `Succeeded`). If the CSV is missing or `Failed` on a *disconnected* cluster, you skipped the §2.8.10.2 mirror step -mirror the SMv3 image into your registry and re-check. On a connected cluster a missing SMv3 CSV usually means the Cluster Ingress Operator itself is unhealthy; investigate `openshift-ingress-operator` before doing anything else.
 
-*Issue*: DSC stays `Not Ready` after the upgrade.
+*Issue*: `authorino-tls-readiness` still fails after Exercise 3.10.
 
-*Solution*: Inspect which component is unhealthy: `oc get dsc default-dsc -o jsonpath='{.status.conditions}' | jq`. The Kueue and Gateway components are the usual suspects -Module 4 covers verifying both.
+*Solution*: Confirm the `authorino-server-cert` Secret was minted by OpenShift's service signer: `oc get secret authorino-server-cert -n kuadrant-system`. If it's missing, the `service.beta.openshift.io/serving-cert-secret-name` annotation didn't take -re-run `oc annotate svc/authorino-authorino-authorization ...` from Sub-step B. The Authorino CR's `listener.tls.enabled` must be `true`; `oidcServer.tls.enabled` must stay `false` (the migration guide intentionally leaves it off).
+
+*Issue*: A converted model goes `READY=False` during the Serverless teardown.
+
+*Solution*: Check the predictor pod with `oc get pods -n <ns> -l serving.kserve.io/inferenceservice=<name>` and its logs. RawDeployment models do not depend on Knative, so the Serverless teardown itself shouldn't affect them; pod restarts later during the upgrade are expected (this is how they pick up the newer kserve and runtime images).
+
+*Issue*: KServe Serverless teardown seems stuck.
+
+*Solution*: It can take 5-10 minutes. Watch `oc get pods -n knative-serving` fall to zero. If it never drains, check `oc logs -n redhat-ods-applications -l app=kserve-controller-manager`.
 
 == Learning outcomes
 
-You've completed the upgrade. You can:
+You've completed the platform remediation. You can:
 
-* [x] Switch the subscription to the `{migration-channel}` migration channel
-* [x] Approve the OLM upgrade as it walks to {target-version}
-* [x] Confirm the operator, DSC, and DSCI are healthy on the new version
-* [x] Move the subscription to `{stable-channel}` for ongoing updates
+* [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
+* [x] Flip every removed component to `Removed` in the correct order
+* [x] Remove the Service Mesh v2 dependency including the lingering member roll
+* [x] Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
+* [x] Freeze every LLMInferenceService against the 3.x template rewrite
+* [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary
 
-The operator is now on {target-version}, the DSC and DSCI are `Ready`, and the subscription is on the stable channel for future patches. In the final module you'll verify the migrated cluster end to end: the component schema rename, HardwareProfile migration, workbench auth patching, and Gateway API routing.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, RHCL is up as the new llm-d auth plane, every LLMInferenceService is template-pinned, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
 
-Continue to *Module 4: Post-upgrade verification*.
+Continue to *Module 4: Handle the workbench images*.

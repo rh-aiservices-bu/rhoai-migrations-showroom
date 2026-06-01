@@ -5,41 +5,46 @@
 
 == Your role
 
-You are the *cluster administrator* responsible for a production Red Hat OpenShift AI {source-version} environment. Red Hat has released OpenShift AI 3.x, and your organization wants to move to it for the new capabilities -unified observability, Kubeflow Trainer v2, external identity provider support, and the Gateway API networking model.
-
-You own the migration end to end: assessing readiness, clearing the blockers, running the upgrade in a maintenance window, and confirming the platform and its workloads come back healthy.
+You are the *cluster administrator* responsible for a production Red Hat OpenShift AI {source-version} environment. Red Hat has released OpenShift AI 3.x, and your organization wants to move to it. You own the migration end to end -and your cluster is not a clean demo. It runs models on serving stacks that 3.x removes, and workbenches built for the old authentication model.
 
 == Why this is a migration, not an upgrade
 
-Previous OpenShift AI version bumps (2.19 to 2.22, 2.22 to 2.25) were routine operator upgrades. The move to 3.x is different. In a single transition:
+Previous OpenShift AI version bumps were routine operator upgrades. The move to 3.x is different. In a single transition:
 
+* *Components are removed*: KServe Serverless mode, ModelMesh Serving, the embedded Kueue, and CodeFlare are all gone in 3.x. The embedded Service Mesh dependency is dropped. You cannot simply disable these -any workload running on them must be migrated off *first*, or it stops serving.
 * *Routing changes*: OpenShift Routes are replaced by Kubernetes Gateway API. Model endpoint URLs and the dashboard URL change.
-* *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched.
-* *Components are removed*: the embedded Kueue, ModelMesh Serving, and CodeFlare are gone in 3.x. The embedded Service Mesh dependency is dropped (OpenShift 4.19+ handles it). Each must be set to `Removed` *before* the upgrade.
+* *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched, and custom images rebuilt.
 * *Schema changes*: the DSC `datasciencepipelines` component is renamed to `aipipelines`, and HardwareProfiles move to a new API group with renamed objects.
 
-Because so much changes at once, *there is no automated rollback*. In production, the only way back is restoring from a verified backup -which is why a real migration always starts with one. In this lab the cluster is disposable, so you'll focus on the migration mechanics themselves.
+Because so much changes at once, *there is no automated rollback*. In production, the only way back is restoring from a verified backup. In this lab the cluster is disposable, so you'll focus on the migration mechanics.
+
+== The order that matters
+
+The single most important idea in this workshop is *sequencing*. You must migrate workloads off a component before you remove the component:
+
+. *Convert the Serverless ISVCs to RawDeployment* -so they survive when Serverless mode is removed.
+. *Migrate the ModelMesh model to KServe* -so it survives when ModelMesh is removed.
+. *Only then* disable Serverless, ModelMesh, Kueue, and CodeFlare on the DSC.
+. *Tear down the Service Mesh dependency*, including a member roll that the operator leaves behind.
+. *Handle the workbenches* -bump images you can, plan rebuilds for the rest, and stop them all.
+. *Upgrade*, then verify everything came back.
+
+Get the order wrong -disable a component while a workload still depends on it -and you lose a running model.
 
 == The assessment-driven workflow
 
-Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster and reports what must change before the upgrade. The workflow is:
-
-. *Assess* - run `rhai-cli lint` and read the findings.
-. *Remediate* - resolve each blocking finding, re-running the assessment between phases.
-. *Upgrade* - once the assessment is clean, switch the subscription channel and approve the upgrade.
-. *Verify* - confirm the cluster is healthy on the new version and finish post-upgrade tasks.
-
-You'll follow exactly that loop.
+Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster and reports what must change. You'll run it, remediate the findings, re-run it between phases, and only upgrade once it's clean. A key lesson in Module 1: the assessment reports *incompatible* workloads and *removed* components -it is **not** a full inventory. Compatible workloads won't appear, so you'll always verify what's running directly.
 
 == Learning objectives
 
 By the end of this workshop you will be able to:
 
-* Run the `rhai-cli` assessment and distinguish *blocking* findings from *advisory* ones
-* Explain why each removed component (Kueue, ModelMesh, CodeFlare, Service Mesh v2) must be disabled before the upgrade
-* Disable the 2.x KServe Serverless stack and uninstall its operators in the correct order
-* Drive the OLM-managed operator upgrade through the migration channel to {target-version}
-* Verify a migrated cluster: DSC/DSCI readiness, the component schema rename, HardwareProfile migration, workbench auth patching, and Gateway API routing
+* Run `rhai-cli lint` and distinguish blocking findings from advisory ones -and know its limits as an inventory
+* Convert Serverless InferenceServices to RawDeployment using the backup-and-recreate pattern the admission webhook forces
+* Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
+* Disable removed components in the correct order, and tear down the Service Mesh dependency cleanly
+* Discover and triage custom workbench images for the new auth and routing model
+* Drive the OLM-managed upgrade to {target-version} and verify the migrated cluster end to end
 
 == Estimated time
 
@@ -47,10 +52,12 @@ By the end of this workshop you will be able to:
 |===
 | Module | Time
 | Module 1: Assess the cluster | 20 min
-| Module 2: Remediate the blockers | 40 min
-| Module 3: Perform the upgrade | 30 min
-| Module 4: Post-upgrade verification | 25 min
-| *Total* | *~2 hours*
+| Module 2: Convert the model-serving workloads | 40 min
+| Module 3: Remediate the platform | 30 min
+| Module 4: Handle the workbench images | 25 min
+| Module 5: Perform the upgrade | 30 min
+| Module 6: Post-upgrade verification | 25 min
+| *Total* | *~2.5 hours*
 |===
 
 When you're ready, move on to *Module 1*.

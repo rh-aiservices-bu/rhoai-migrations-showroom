@@ -1,0 +1,625 @@
+= Module 6: Post-upgrade verification
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+The operator reports {target-version} and the DSC is `Ready`, but the migration isn't finished until you've verified *every* component that was running before the upgrade is healthy on the new platform. The models matter most -but Ray, Feast, KFTO, Model Registry, AI Pipelines, Llama Stack, and TrustyAI each have their own post-upgrade tasks too.
+
+In this module you'll confirm platform health, verify the four converted models survived, check the schema and HardwareProfile migrations, patch the workbenches onto the new auth model, run the Ray cluster migration script, verify KFTO / Feast / Model Registry / AI Pipelines / Llama Stack / TrustyAI each survived (and restore TrustyAI data if any was lost), and confirm the Gateway API is serving traffic at the new URLs.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Verify the operator, DSC, and DSCI are healthy on {target-version}
+* Confirm the converted models are still serving and capture their new endpoint URLs
+* Confirm the `datasciencepipelines` to `aipipelines` rename and the HardwareProfile migration
+* Patch stopped workbenches onto the 3.x kube-rbac-proxy auth model
+* Run the RayCluster migration script to take each cluster over to KubeRay-only management
+* Verify KFTO PyTorchJobs, Feast Feature Stores, Model Registry pods, and DSPAs all survived
+* Recreate Llama Stack distributions against the new 3.x schema
+* Compare TrustyAI metrics + data against the pre-upgrade backups, restore lost data, check Guardrails, and break GPU deadlocks if they appear
+
+== Exercise 6.1: Confirm platform health
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
+oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+rhods-operator.3.3.3   Succeeded
+DSC: Ready
+DSCI: Ready
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get co | grep -v "True .* False .* False" | tail -n +2 || echo "all cluster operators healthy"
+----
+
+✓ DSC and DSCI are `Ready`, the CSV is `rhods-operator.3.3.3`, and cluster operators are healthy
+
+== Exercise 6.2: Confirm the converted models still serve
+
+This is the payoff for the conversions in Module 2. All four models should be `Ready` on RawDeployment. Their predictor pods *were* restarted during the upgrade -that's how the 3.x kserve controller rolls them onto the newer kserve runtime images (including a newer vLLM). What matters is that every ISVC recovers to `Ready=True` on the new platform:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status,URL:.status.url'
+----
+
+[.console-output]
+----
+NS               NAME                 MODE            READY   URL
+ml-project-a     my-serverless-isvc   RawDeployment   True    https://my-serverless-isvc-ml-project-a...
+ml-project-b     another-sl-model     RawDeployment   True    https://another-sl-model-ml-project-b...
+ml-project-c     mobilenet-onnx       RawDeployment   True    https://mobilenet-onnx-ml-project-c...
+ml-project-raw   tinyllama-1b-cpu     RawDeployment   True    https://tinyllama-1b-cpu-ml-project-raw...
+----
+
+Note the `URL` column -those endpoints now route through Gateway API instead of the old Routes. Two things changed during the upgrade: the `.status.url` (Routes → Gateway API hostname) and the predictor pods themselves (rolled by the 3.x kserve controller onto the newer runtime images). Capture the new URLs so you can hand them to downstream consumers:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} -> {.status.url}{"\n"}{end}'
+----
+
+[NOTE]
+====
+In-cluster callers using the Kubernetes Service DNS name (`<model>.<namespace>.svc.cluster.local`) are unaffected. Only *external* callers using the model's `.status.url` need the new value -the old Route-based hostname no longer resolves.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length'
+----
+
+[.console-output]
+----
+4
+----
+
+✓ All four models report `Ready=True` on RawDeployment
+
+== Exercise 6.3: Confirm the schema rename
+
+During the 3.x reconciliation the DSC `datasciencepipelines` component is renamed to `aipipelines`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='aipipelines={.spec.components.aipipelines.managementState}{"\n"}datasciencepipelines={.spec.components.datasciencepipelines.managementState}{"\n"}'
+----
+
+[.console-output]
+----
+aipipelines=Managed
+datasciencepipelines=
+----
+
+[NOTE]
+====
+Any automation referencing `.spec.components.datasciencepipelines` must be updated to `.spec.components.aipipelines`. New DSC fields `trainer` and `mlflowoperator` also appear, both defaulting to `Removed`.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.spec.components.aipipelines.managementState}{"\n"}'
+----
+
+✓ `aipipelines` is present and `Managed`
+
+== Exercise 6.4: Confirm the HardwareProfile migration
+
+Legacy HardwareProfiles auto-migrate from `dashboard.opendatahub.io/v1alpha1` to `infrastructure.opendatahub.io`, and the objects are *renamed* in the process:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications
+----
+
+[IMPORTANT]
+====
+The objects are renamed (for example `large-notebooks-17kpw` becomes `containersize-large-notebooks`). Any user automation or workbench definition that referenced the old names by hand needs updating.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications --no-headers | wc -l
+----
+
+✓ The migrated HardwareProfiles exist in the `infrastructure.opendatahub.io` API group
+
+== Exercise 6.5: Patch the workbenches onto the new auth model
+
+Workbenches still carry the 2.x oauth-proxy configuration. Under 3.x they need kube-rbac-proxy or they hit redirect loops on first start. The `rhai-cli` helper patches each stopped workbench in place.
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh patch --only-stopped --with-cleanup -y
+'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh list --all
+'
+----
+
+[.console-output]
+----
+Migration status:
+  Legacy (2.x):     0
+  Migrated (3.x):   <N>
+OK: All workbenches have been migrated.
+----
+
+✓ All workbenches report `Migrated (3.x)`
+
+[NOTE]
+====
+The custom workbench image you identified in Module 4 still needs a rebuild before its owner can start a workbench from it. The helper patches the *Notebook CR*, but an image that bakes in oauth-proxy must be rebuilt separately -that's the deferred, application-owner task.
+====
+
+== Exercise 6.6: Migrate the RayClusters to KubeRay
+
+The CodeFlare operator is gone; KubeRay now manages Ray clusters directly. The pre-upgrade backups from Exercise 3.1 are your safety net -if the migration script breaks a CR, restore from the 2.x backup, fix the diff by hand, and re-apply.
+
+[IMPORTANT]
+====
+Run this *after* the workbench patch in Exercise 6.5. Running the Ray migration before workbench controllers are reconciled produces inconsistent owner-references.
+====
+
+List current state:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py list
+----
+
+Dry-run first:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py post-upgrade --dry-run
+----
+
+Migrate every RayCluster on the cluster (the script prompts for confirmation; answer `yes`):
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -it -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py post-upgrade
+----
+
+Each migrated cluster restarts its head + worker pods. Expect a brief downtime per cluster.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py list
+oc get raycluster -A
+----
+
+✓ Every RayCluster is `Status=ready`, available workers match desired, and the migration helper reports the cluster as migrated
+
+[NOTE]
+====
+If the 2.x install never carried CodeFlare TLS/OAuth sidecars or a dashboard Route (the lab install is clean upstream KubeRay), `post-upgrade` may print `Migrated: N` but `list` still says `[NEEDS MIGRATION]`. That's harmless -if `oc describe raycluster` shows no legacy sidecar and pods are `Running`, the CR is already 3.x-shaped.
+====
+
+== Exercise 6.7: Verify KFTO PyTorchJobs survived
+
+PyTorchJobs run through the upgrade and resume normally. RHOAI 3.x will eventually move to *Kubeflow Trainer v2* (`TrainJob` API), but the legacy KFTO v1 `PyTorchJob` is still supported -no spec changes needed.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pytorchjob -A
+----
+
+[.console-output]
+----
+NAMESPACE          NAME                           STATE       AGE
+pytorch-training   pytorch-distributed-training   Running     3h
+----
+
+If a job is stuck `Failed`, inspect:
+
+[.console-input]
+[source,role="execute"]
+----
+NS=pytorch-training; NAME=pytorch-distributed-training
+oc describe pytorchjob $NAME -n $NS
+oc get pods -n $NS -l training.kubeflow.org/job-name=$NAME
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pytorchjob -A -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.status.conditions[-1].type)"'
+----
+
+✓ Every PyTorchJob shows `Running` or `Succeeded`. None are stuck in `Failed`
+
+== Exercise 6.8: Verify Feast Feature Store
+
+Feature Store was Tech Preview in 2.25 and is GA in 3.3. The component itself doesn't change shape -only the support status moves.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pods -n redhat-ods-applications | grep feast-operator
+oc get featurestores -A
+----
+
+[.console-output]
+----
+feast-operator-controller-manager-...   1/1   Running
+NAMESPACE       NAME              STATUS   AGE
+project-alpha   my-featurestore   Ready    3h
+----
+
+Also check the user-defined CronJobs in each Feature Store namespace (ingestion schedules):
+
+[.console-input]
+[source,role="execute"]
+----
+for ns in $(oc get featurestore -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
+  echo "--- $ns ---"
+  oc get cronjob -n "$ns"
+done
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get featurestores -A -o json | jq -r '.items[] | select(.status.phase != "Ready") | "\(.metadata.namespace)/\(.metadata.name) \(.status.phase)"' | { grep . || echo "all featurestores Ready"; }
+----
+
+✓ Every Feature Store reports `Ready`, the feast-operator is `Running`
+
+== Exercise 6.9: Verify Model Registry (and tell users about the nav change)
+
+The Model Registry survives unchanged, but in 3.x the dashboard nav moves from *Models → Model registry* to *AI hub → Registry*. The catalog also splits into two pods (`model-catalog` + `model-catalog-postgres` -new in 3.x).
+
+[.console-input]
+[source,role="execute"]
+----
+oc get modelregistries.modelregistry.opendatahub.io -A
+oc get pods -n rhoai-model-registries
+----
+
+[.console-output]
+----
+NAMESPACE                NAME                AVAILABLE   AGE
+rhoai-model-registries   my-model-registry   True        3h
+
+NAME                                    READY   STATUS    RESTARTS   AGE
+model-catalog-...                       2/2     Running   0          ...
+model-catalog-postgres-...              1/1     Running   0          ...
+my-model-registry-...                   1/1     Running   0          ...
+my-model-registry-db-...                1/1     Running   0          ...
+----
+
+Confirm the new PVC bound (the `model-catalog-postgres` pod gets a fresh PVC at 3.x install):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pvc -n rhoai-model-registries
+----
+
+[IMPORTANT]
+====
+Tell users: *AI hub → Registry* is the new nav path. The old "Model registry" link from 2.x is gone; without comms users will look for it and not find it.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get modelregistries.modelregistry.opendatahub.io -A -o json \
+  | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) Available=\(.status.conditions[-1].status // .status.availableReplicas // "?")"'
+----
+
+✓ Every Model Registry reports `Available=True` and all four pods (`model-catalog`, `model-catalog-postgres`, `<registry>`, `<registry>-db`) are `Running`
+
+== Exercise 6.10: AI Pipelines post-upgrade check
+
+The DSPA pre-upgrade helper from Exercise 3.3 wrote a snapshot of every pipeline server pod to `/tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json`. The post-upgrade helper diffs against it.
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  bash /opt/rhai-upgrade-helpers/ai_pipelines/post_upgrade_check.sh
+----
+
+Expect `All pipelines server pods are healthy` or a note that an idle DSPA stayed idle. If you skipped Exercise 3.3, the script exits with `ERROR: Pre-upgrade state file not found` -fall back to manual verification:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dspa -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+for ns in $(oc get dspa -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
+  echo "--- $ns ---"; oc get pods -n "$ns" -l component=data-science-pipelines
+done
+----
+
+[NOTE]
+====
+DSPA endpoint URLs moved from Route to Gateway API. External CI/CD that triggers pipelines against the old 2.x Route URL will 404 -audit every integration (GitHub Actions, Jenkins, bookmarks) and update to the new Gateway-based URL captured in Exercise 6.2.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dspa -A -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)=\((.status.conditions[]? | select(.type=="Ready") | .status))"'
+----
+
+✓ Every DSPA reports `Ready=True`. Confirm with at least one pipeline user that they can import + run a pipeline through the dashboard
+
+== Exercise 6.11: Recreate the Llama Stack distribution
+
+You deleted any 2.x LSDs in Exercise 3.4 because the schema is incompatible (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible). If your cluster needs Llama Stack, deploy a fresh LSD CR matching the 3.3.3 schema now.
+
+Key shape differences:
+
+[cols="1,1,1"]
+|===
+| Field | 2.25 | 3.3.3
+
+| Database | SQLite (in-pod) | PostgreSQL 14+ (external)
+| Embedding | Implicit | *Must* declare explicit provider (e.g. `sentence-transformers`)
+| Vector | VectorDB (deprecated) | Vector_IO
+| Config file | `run.yaml` | `config.yaml`
+| Client | `llama-stack-client` 0.2.x | `llama-stack-client` 0.4.x
+|===
+
+Follow the *Deploying a Llama Stack server* docs for 3.3.3 (link in the conclusion) for the CR shape. Recreate any agents / RAG pipelines that depended on the old LSD -they cannot reuse 2.x state.
+
+For the lab, the original LSD was a Tech Preview workload with no production data; skip the recreation and document "not recreated" in the migration report. On a production cluster, deploy one fresh LSD per namespace that needs it.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llamastackdistribution -A
+----
+
+✓ Either: every recreated LSD reports `PHASE=Ready`. *Or* (the lab path): no LSDs were recreated and the migration report reflects that
+
+== Exercise 6.12: Verify TrustyAI and restore any lost data
+
+TrustyAI's storage schema changed across the upgrade. The pre-upgrade backups from Exercise 3.2 are what you compare against to confirm no data was lost. Four sub-steps, in order.
+
+=== Sub-step A: Confirm the operator is healthy
+
+[.console-input]
+[source,role="execute"]
+----
+oc wait --for=condition=Available deployment/trustyai-service-operator-controller-manager \
+  -n redhat-ods-applications --timeout=120s
+oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase'
+----
+
+=== Sub-step B: Check for data loss
+
+For each TrustyAIService that had a backup, compare the post-upgrade metric count against the backup:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  export BACKUP_DIR=/tmp/rhoai-upgrade-backup/trustyai
+  ls ${BACKUP_DIR}/trustyai-metrics-*.json 2>/dev/null \
+    | sed "s|.*/trustyai-metrics-||;s|-[0-9]\{8\}-[0-9]\{6\}\.json||" \
+    | sort -u
+'
+----
+
+If a namespace shows live metric count < backup metric count, run the restore helper (see migration guide §4.6 for the full data-load procedure):
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  bash /opt/rhai-upgrade-helpers/trustyai/restore_metrics.sh --namespace <ns>
+----
+
+=== Sub-step C: Verify GuardrailsOrchestrator
+
+If you have `GuardrailsOrchestrator` CRs, confirm each came back Ready and its `otelExporter` block is intact. A CR pointing at a missing `orchestratorConfig` ConfigMap will stay silently stuck in `phase=Progressing` with zero pods.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get guardrailsorchestrator -A
+oc get guardrailsorchestrator -A -o json \
+  | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)  otel=\(.spec.otelExporter // "none")"'
+----
+
+If `otelExporter` was scrubbed and you have the pre-upgrade backup file, restore it (note: the 3.x CRD splits `otlpEndpoint` into `otlpMetricsEndpoint` and `otlpTracesEndpoint`):
+
+[.console-input]
+[source,role="execute"]
+----
+# Use oc explain guardrailsorchestrator.spec.otelExporter to confirm the 3.x schema first
+oc explain guardrailsorchestrator.spec.otelExporter
+----
+
+=== Sub-step D: Check for GPU deadlocks
+
+GPU-backed ISVCs sharing a namespace with a TrustyAI service can hit a Pending/Running deadlock in 3.x. Check each GPU TrustyAI namespace:
+
+[.console-input]
+[source,role="execute"]
+----
+for ns in $(oc get trustyaiservice -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
+  echo "--- $ns ---"
+  oc exec -n rhai-migration rhai-cli-0 -- bash -c "cd /opt/rhai-upgrade-helpers/trustyai && ./break-gpu-deadlock.sh --namespace $ns --check" 2>/dev/null || true
+done
+----
+
+If a deadlock is reported, run `--fix` for that namespace (destructive -deletes the older pod):
+
+[.console-input]
+[source,role="execute"]
+----
+# oc exec -n rhai-migration rhai-cli-0 -- bash -c 'cd /opt/rhai-upgrade-helpers/trustyai && ./break-gpu-deadlock.sh --namespace <ns> --fix'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get trustyaiservice -A -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)=\(.status.phase // "no status")"'
+oc get guardrailsorchestrator -A -o json | jq -r '.items[]? | "\(.metadata.namespace)/\(.metadata.name) phase=\(.status.phase // "?")"' 2>/dev/null
+----
+
+✓ Every TrustyAIService is healthy, no namespaces have data-loss vs backup, GuardrailsOrchestrators are Ready, no GPU deadlocks remain
+
+== Exercise 6.13: Verify Gateway API routing
+
+RHOAI 3.x routes through Kubernetes Gateway API. Confirm the GatewayConfig is ready and find the Gateway data-plane (it runs in `openshift-ingress`):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfigs -A -o wide
+oc get gateway -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,PROGRAMMED:.status.conditions[?(@.type=="Programmed")].status'
+oc get pods -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=data-science-gateway
+----
+
+The dashboard URL has changed -get the new hostname:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.spec.hostname}{"\n"}{end}'
+----
+
+[NOTE]
+====
+The pre-upgrade dashboard URL (`rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}`) no longer resolves. The new dashboard is at `https://data-science-gateway.{openshift_cluster_ingress_domain}`.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get gatewayconfigs -A -o jsonpath='{range .items[*]}{.metadata.name}: ready{"\n"}{end}'
+----
+
+✓ The GatewayConfig is ready and the Gateway data-plane pods are running in `openshift-ingress`
+
+== Exercise 6.14: Final assessment
+
+Confirm the cluster is clean on {target-version}:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -E 'blocking|✗' || echo "No blocking findings -migration complete"
+oc get dsc default-dsc -o jsonpath='release version: {.status.release.version}{"\n"}'
+----
+
+[.console-output]
+----
+No blocking findings -migration complete
+release version: 3.3.3
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='{.status.release.version}{"\n"}'
+----
+
+[.console-output]
+----
+3.3.3
+----
+
+✓ The DSC reports release version `3.3.3` and the assessment is clean
+
+== Troubleshooting
+
+*Issue*: A converted model is `Ready=False` after the upgrade.
+
+*Solution*: Check the predictor pod with `oc get pods -n <ns> -l serving.kserve.io/inferenceservice=<name>` and its logs. The 3.x kserve controller rolls each predictor onto the newer runtime image during the upgrade; a model that doesn't come back is almost always a runtime-image / model-spec mismatch (incompatible vLLM flag, missing GPU resource, model artifact path drift). The events on the predictor Deployment and the pod logs are where the cause shows up.
+
+*Issue*: GatewayConfig stuck `Not Ready` and the dashboard URL doesn't resolve.
+
+*Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST is rejected. Disable the operator-managed NetworkPolicy: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
+
+*Issue*: The workbench helper reports `Failed: N`.
+
+*Solution*: Do not force-start those workbenches. Inspect each with `oc describe notebook <name> -n <ns>`. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
+
+== Learning outcomes
+
+You've completed the verification phase and the migration. You can:
+
+* [x] Verify the operator, DSC, and DSCI are healthy on {target-version}
+* [x] Confirm the converted models still serve and capture their new endpoint URLs
+* [x] Confirm the `aipipelines` rename and the HardwareProfile migration
+* [x] Patch workbenches onto the 3.x auth model and verify Gateway API routing
+* [x] Migrate RayClusters to KubeRay-only management with the helper script
+* [x] Verify KFTO PyTorchJobs, Feast Feature Stores, Model Registry, and DSPAs all survived the upgrade
+* [x] Recreate Llama Stack distributions against the new 3.x schema
+* [x] Compare TrustyAI metrics + data against pre-upgrade backups, restore lost data, verify Guardrails, and break GPU deadlocks
+
+== Module summary
+
+The cluster is fully migrated to {target-version}: the platform is healthy, all four models are still serving on RawDeployment through Gateway API, the schema and HardwareProfiles migrated, workbenches are patched, RayClusters are running under KubeRay-only management, KFTO PyTorchJobs / Feast / Model Registry / AI Pipelines all survived, the Llama Stack distribution has been recreated against the new schema (or documented as retired), and TrustyAI is verified against its pre-upgrade backups. Continue to the *Conclusion* to review what you accomplished.

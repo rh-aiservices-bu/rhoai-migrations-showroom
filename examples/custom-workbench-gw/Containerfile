@@ -1,0 +1,54 @@
+# RHOAI 3.x-ready custom workbench image.
+#
+# Rebuilt from the upstream community SciPy notebook that the 2.x BYON image used
+# (quay.io/jupyter/scipy-notebook:lab-4.2.5). The two changes that make it work in
+# RHOAI 3.x:
+#
+#   1. No oauth-proxy. RHOAI 3.x injects kube-rbac-proxy at the platform level, so
+#      this image carries no oauth-proxy binary, config, or sidecar wiring -it only
+#      serves the notebook on port 8888. (The 2.x image bundled oauth-proxy and hit
+#      redirect loops under 3.x.)
+#
+#   2. NB_PREFIX-aware entrypoint. The start script serves Jupyter under the path
+#      prefix the notebook controller passes in NB_PREFIX, so the workbench works
+#      behind Gateway API path-based routing.
+#
+# Build and push (this is what produced the lab's gw-workbench-image):
+#   podman build -t quay.io/<org>/custom-scipy-notebook-gw:3.x -f Containerfile .
+#   podman push  quay.io/<org>/custom-scipy-notebook-gw:3.x
+#
+# Production note: for a fully supported image, rebase on a Red Hat UBI9 + Python
+# base rather than the community image. Layering on the community base (as below)
+# is the pragmatic path most BYON authors take and is sufficient for this lab.
+
+FROM quay.io/jupyter/scipy-notebook:lab-4.2.5
+
+LABEL io.opendatahub.notebooks="true" \
+      io.openshift.build.image="quay.io/jupyter/scipy-notebook:lab-4.2.5" \
+      io.openshift.expose-services="8888:http" \
+      io.k8s.description="Custom SciPy notebook rebuilt for RHOAI 3.x (gateway-ready)" \
+      maintainer="rhoai-migration-workshop"
+
+USER root
+
+# Same packages the 2.x image layered (../custom-workbench-2x/). The whole point of
+# this rebuild is "same user-visible image, made compatible with 3.x" — so the
+# packages have to match. If you add anything to the 2.x Containerfile, add it here too.
+RUN pip install --no-cache-dir \
+      'mlflow~=2.9' \
+      'onnxruntime~=1.17'
+
+# Install the RHOAI-aware entrypoint that honors NB_PREFIX.
+COPY start-rhoai-notebook.sh /usr/local/bin/start-rhoai-notebook.sh
+RUN chmod +x /usr/local/bin/start-rhoai-notebook.sh
+
+# OpenShift runs containers with an arbitrary UID by default. Make the working
+# directory group-writable so the notebook server can run as any UID in the
+# root group. (Alternatively, grant the workbench ServiceAccount the anyuid SCC.)
+RUN chgrp -R 0 /home/jovyan && chmod -R g=u /home/jovyan
+
+# Drop back to the non-root notebook user defined by the base image.
+USER ${NB_UID}
+
+EXPOSE 8888
+ENTRYPOINT ["/usr/local/bin/start-rhoai-notebook.sh"]

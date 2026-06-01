@@ -1,0 +1,38 @@
+# Custom workbench image for RHOAI 2.x — the "before" state of the workshop.
+#
+# Represents a typical customer BYON workbench: a community Jupyter base with a few
+# data-science packages layered on top. It works under RHOAI 2.x because the platform
+# injects an oauth-proxy sidecar and exposes the workbench through an OpenShift Route
+# at the host root — the image itself doesn't have to know about path prefixes or auth.
+#
+# This image will NOT work under RHOAI 3.x (oauth-proxy is gone, replaced by
+# kube-rbac-proxy; routing moves to Gateway API with path-based NB_PREFIX). The 3.x
+# version is in ../custom-workbench-gw/.
+#
+# Build + push: see ../README.md.
+
+FROM quay.io/jupyter/scipy-notebook:lab-4.2.5
+
+LABEL io.opendatahub.notebooks="true" \
+      maintainer="rhoai-migration-workshop" \
+      io.openshift.expose-services="8888:http" \
+      io.k8s.description="Custom SciPy notebook (RHOAI 2.x BYON sample)"
+
+USER root
+
+# A few packages a customer might layer on top of the base. Light enough to stay small
+# but realistic — mlflow client + onnxruntime are common adds for data-science teams.
+RUN pip install --no-cache-dir \
+      'mlflow~=2.9' \
+      'onnxruntime~=1.17'
+
+# OpenShift runs containers with an arbitrary UID. Make the workdir group-writable so
+# the notebook server can write as any UID in the root group.
+RUN chgrp -R 0 /home/jovyan && chmod -R g=u /home/jovyan
+
+USER ${NB_UID}
+EXPOSE 8888
+
+# Inherits the upstream entrypoint (start-notebook.sh from jupyter/docker-stacks),
+# which launches Jupyter without NB_PREFIX awareness. That works under 2.x but breaks
+# under 3.x — which is exactly the point this image is making in the workshop.

@@ -1,272 +1,114 @@
-= Module 2: Remediate the blockers
+= Module 2: Convert the model-serving workloads
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-The assessment found four blocking findings, all components that 3.x removes. In this module you'll clear them in the correct order, patch the model-serving ConfigMap, stop the workbenches, and uninstall the 2.x KServe Serverless operator stack.
+This is the heart of the migration. Your cluster runs four models: two on KServe Serverless mode, one on ModelMesh, and one already on KServe RawDeployment. The first three are the work -both Serverless and ModelMesh are removed in 3.x, and if you disable those components while the models still depend on them, the models stop serving. The RawDeployment model is already 3.x-compatible and you leave it alone.
 
-Order matters here. The KServe Serverless teardown must drain before you remove the Service Mesh dependency, and the Service Mesh member roll has to be deleted before its operator can be uninstalled. You'll do each step and verify it before moving on.
+So you convert *first*. In this module you'll convert the two Serverless InferenceServices to RawDeployment using the backup-and-recreate pattern the admission webhook forces, then migrate the ModelMesh model to a single-model KServe RawDeployment. Only after this is done -in Module 3 -will you disable the components.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`) to `Removed`
-* Disable KServe Serverless mode and switch the default deployment mode to RawDeployment
-* Remove the Service Mesh dependency cleanly, including the lingering member roll
-* Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
+* Enumerate InferenceServices by deployment mode
+* Convert a Serverless ISVC to RawDeployment with backup-and-recreate (the webhook blocks in-place edits)
+* Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
+* Verify every model is RawDeployment and `Ready` before touching the components
 
-== Exercise 2.1: Disable Kueue
+== Exercise 2.1: Enumerate what needs converting
 
-RHOAI 2.25 deprecated the embedded Kueue distribution; 3.3 removes it. Leaving Kueue `Managed` at upgrade time is the highest-risk mistake in the whole migration: the Kueue admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster -not just RHOAI.
-
-Flip Kueue to `Removed`:
+List every InferenceService that is *not* already RawDeployment:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
-  "spec": { "components": { "kueue": { "managementState": "Removed" } } }
-}'
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get dsc default-dsc -o jsonpath='kueue: {.spec.components.kueue.managementState}{"\n"}'
-oc get dsc default-dsc -o jsonpath='{range .status.conditions[?(@.type=="KueueReady")]}{.status} {.reason}{"\n"}{end}'
+oc get isvc -A -o json | jq -r '.items[]
+  | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") != "RawDeployment")
+  | "\(.metadata.namespace)\t\(.metadata.name)\t\(.metadata.annotations."serving.kserve.io/deploymentMode")"'
 ----
 
 [.console-output]
 ----
-kueue: Removed
-False Removed
+ml-project-a   my-serverless-isvc   Serverless
+ml-project-b   another-sl-model     Serverless
+ml-project-c   my-modelmesh-isvc    ModelMesh
 ----
 
-✓ `kueue` is `Removed`. The `KueueReady=False` with reason `Removed` is expected and correct -the component is intentionally gone.
-
-== Exercise 2.2: Disable Ray and CodeFlare
-
-The 3.x release drops the CodeFlare operator; KubeRay continues to manage Ray clusters directly. The DSC has *two* separate components, `codeflare` and `ray`, even though the assessment reports the blocker under the `ray/removal` check. Flip both:
-
-[.console-input]
-[source,role="execute"]
-----
-oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
-  "spec": { "components": {
-    "codeflare": { "managementState": "Removed" },
-    "ray":       { "managementState": "Removed" }
-  } }
-}'
-----
+Two Serverless and one ModelMesh -all three must be migrated. The already-RawDeployment ISVC (`tinyllama-1b-cpu` in `ml-project-raw`) is filtered out by the query above; it needs no work.
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='ray={.spec.components.ray.managementState} codeflare={.spec.components.codeflare.managementState}{"\n"}'
+oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}={.metadata.annotations.serving\.kserve\.io/deploymentMode}{"\n"}{end}'
 ----
 
-[.console-output]
-----
-ray=Removed codeflare=Removed
-----
+✓ You see two `Serverless` and one `ModelMesh` ISVC
 
-✓ Both `ray` and `codeflare` are `Removed`
-
-== Exercise 2.3: Disable ModelMesh Serving
-
-ModelMesh Serving is removed in 3.x. Any models you keep serving will use KServe RawDeployment instead. Flip the component to `Removed`:
-
-[.console-input]
-[source,role="execute"]
-----
-oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
-  "spec": { "components": { "modelmeshserving": { "managementState": "Removed" } } }
-}'
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get dsc default-dsc -o jsonpath='modelmeshserving: {.spec.components.modelmeshserving.managementState}{"\n"}'
-oc get pods -n redhat-ods-applications -l control-plane=modelmesh-controller --no-headers 2>/dev/null | wc -l
-----
-
-[.console-output]
-----
-modelmeshserving: Removed
-0
-----
-
-✓ `modelmeshserving` is `Removed` and its controller pods are gone
-
-== Exercise 2.4: Patch the model-serving ConfigMap
-
-Before disabling KServe Serverless, set the `inferenceservice-config` ConfigMap to unmanaged and add the hardware-profile annotations to its disallowed list. Without this, deployed models can get restarted during the upgrade. This was the `advisory` finding in your assessment -on a cluster with running models it is important, not optional.
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-applications annotate configmap inferenceservice-config \
-  opendatahub.io/managed=false --overwrite
-
-NEW_JSON=$(oc -n redhat-ods-applications get cm inferenceservice-config \
-  -o jsonpath='{.data.inferenceService}' \
-  | jq -c '.serviceAnnotationDisallowedList |= (. + ["opendatahub.io/hardware-profile-name", "opendatahub.io/hardware-profile-namespace"] | unique)')
-
-oc -n redhat-ods-applications patch cm inferenceservice-config --type=merge \
-  -p "$(jq -n --arg v "$NEW_JSON" '{data: {inferenceService: $v}}')"
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-applications get cm inferenceservice-config \
-  -o jsonpath='managed={.metadata.annotations.opendatahub\.io/managed}{"\n"}'
-oc -n redhat-ods-applications get cm inferenceservice-config \
-  -o jsonpath='{.data.inferenceService}' | jq '.serviceAnnotationDisallowedList'
-----
-
-✓ Annotation `opendatahub.io/managed` is `false`
-
-✓ The disallowed list now contains `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace`
-
-== Exercise 2.5: Stop the workbenches
-
-All workbenches must be stopped before the upgrade. Unmigrated, running workbenches hit redirect loops under the new 3.x authentication model. The notebook controller treats the `kubeflow-resource-stopped` annotation as "stopped if present" -the dashboard sets it to a timestamp, so use one here too.
-
-First, survey what's running (by pod count, which is the reliable signal):
-
-[.console-input]
-[source,role="execute"]
-----
-for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
-  ns="${nb%/*}"; name="${nb##*/}"
-  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  [ "$pods" -gt 0 ] && echo "$nb has $pods pod(s) running"
-done
-----
-
-Stop every workbench (in a real migration this disconnects active users, so it happens in the maintenance window):
-
-[.console-input]
-[source,role="execute"]
-----
-STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
-  ns="${row%/*}"; name="${row##*/}"
-  oc -n "$ns" annotate notebook "$name" \
-    kubeflow-resource-stopped="$STAMP" --overwrite
-done
-----
-
-=== Verify
-
-Re-run the survey -it should print nothing:
-
-[.console-input]
-[source,role="execute"]
-----
-for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
-  ns="${nb%/*}"; name="${nb##*/}"
-  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  [ "$pods" -gt 0 ] && echo "$nb still has $pods pod(s)"
-done
-echo "survey complete"
-----
-
-[.console-output]
-----
-survey complete
-----
-
-✓ No workbench reports running pods
-
-== Exercise 2.6: Disable KServe Serverless mode
-
-This is the largest reconciliation in the sequence. Setting `serving` to `Removed` tears down the Knative stack; setting `defaultDeploymentMode` to `RawDeployment` ensures the next model created uses the supported 3.x mode.
+== Exercise 2.2: Convert the first Serverless ISVC
 
 [WARNING]
 ====
-On a cluster with deployed models, confirm every InferenceService is already `RawDeployment` before this step so it isn't caught in the Serverless teardown:
-
-`oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.annotations.serving\.kserve\.io/deploymentMode}{"\n"}{end}'`
-
-Every line should end in `=RawDeployment`. If any are Serverless, convert them first.
+You cannot convert a Serverless ISVC with an in-place `oc patch`. The KServe admission webhook rejects it: `deploymentMode cannot be changed from 'Serverless' to 'RawDeployment'`. You must back up the spec, delete the ISVC, and recreate it with the new annotation.
 ====
 
-[.console-input]
-[source,role="execute"]
-----
-oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
-  "spec": { "components": { "kserve": {
-    "serving": { "managementState": "Removed" },
-    "defaultDeploymentMode": "RawDeployment"
-  } } }
-}'
-----
-
-This takes several minutes. Watch the Knative stack drain:
+Convert `my-serverless-isvc` in `ml-project-a`. First, back up the spec with server-managed fields stripped:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get knativeserving -A
+NS=ml-project-a; NAME=my-serverless-isvc
+oc get isvc "$NAME" -n "$NS" -o yaml \
+  | yq eval 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)' - \
+  > "/tmp/isvc-${NS}-${NAME}.yaml"
 ----
 
-Re-run the command until it reports `No resources found`.
+Flip the deployment mode in the backup, delete the old ISVC, and recreate it:
+
+[.console-input]
+[source,role="execute"]
+----
+NS=ml-project-a; NAME=my-serverless-isvc
+yq -i '.metadata.annotations."serving.kserve.io/deploymentMode" = "RawDeployment"' "/tmp/isvc-${NS}-${NAME}.yaml"
+oc delete isvc "$NAME" -n "$NS"
+oc apply -f "/tmp/isvc-${NS}-${NAME}.yaml"
+----
 
 === Verify
 
+Wait for the recreated ISVC to come back as RawDeployment and Ready (the model reloads, so give it a couple of minutes):
+
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='serving={.spec.components.kserve.serving.managementState} mode={.spec.components.kserve.defaultDeploymentMode}{"\n"}'
-oc get knativeserving -A 2>&1 | tail -1
+oc get isvc my-serverless-isvc -n ml-project-a \
+  -o custom-columns='NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,STATUS:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
 ----
 
 [.console-output]
 ----
-serving=Removed mode=RawDeployment
-No resources found
+NAME                 MODE            STATUS          READY
+my-serverless-isvc   RawDeployment   RawDeployment   True
 ----
 
-✓ `serving=Removed`, `defaultDeploymentMode=RawDeployment`, and Knative has drained
+✓ `MODE` and `STATUS` are both `RawDeployment` and `READY` is `True`
 
-== Exercise 2.7: Remove the Service Mesh dependency
+== Exercise 2.3: Convert the second Serverless ISVC
 
-OpenShift 4.19+ handles service mesh internally, so RHOAI 3.x no longer needs the embedded Service Mesh. Set the DSCI `serviceMesh` to `Removed` -this drains the ServiceMeshControlPlane (SMCP):
+Repeat for `another-sl-model` in `ml-project-b`:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc patch dsci default-dsci --type=merge -p '{
-  "spec": { "serviceMesh": { "managementState": "Removed" } }
-}'
-----
-
-Wait for the SMCP to drain:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get smcp -A
-----
-
-Re-run until it reports `No resources found`. Then delete the leftover ServiceMeshMemberRoll. The DSCI change drains the SMCP but does *not* delete the member roll -it lingers with a `maistra.io/istio-operator` finalizer. Delete it now, while the Service Mesh operator is still installed to process the finalizer:
-
-[.console-input]
-[source,role="execute"]
-----
-oc delete smmr default -n istio-system --ignore-not-found
+NS=ml-project-b; NAME=another-sl-model
+oc get isvc "$NAME" -n "$NS" -o yaml \
+  | yq eval 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)' - \
+  > "/tmp/isvc-${NS}-${NAME}.yaml"
+yq -i '.metadata.annotations."serving.kserve.io/deploymentMode" = "RawDeployment"' "/tmp/isvc-${NS}-${NAME}.yaml"
+oc delete isvc "$NAME" -n "$NS"
+oc apply -f "/tmp/isvc-${NS}-${NAME}.yaml"
 ----
 
 === Verify
@@ -274,36 +116,56 @@ oc delete smmr default -n istio-system --ignore-not-found
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsci default-dsci -o jsonpath='serviceMesh: {.spec.serviceMesh.managementState}{"\n"}'
-oc get smcp,smmr -A 2>&1 | tail -2
+oc get isvc -A -o json | jq -r '.items[]
+  | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") == "Serverless")
+  | "\(.metadata.namespace)/\(.metadata.name)"' || true
+echo "--- no Serverless ISVCs should be listed above ---"
 ----
 
 [.console-output]
 ----
-serviceMesh: Removed
-No resources found
+--- no Serverless ISVCs should be listed above ---
 ----
 
-✓ `serviceMesh` is `Removed` and both the SMCP and SMMR are gone
+✓ No Serverless ISVCs remain
 
-== Exercise 2.8: Uninstall the 2.x serving operators
+== Exercise 2.4: Understand the ModelMesh model
 
-The OpenShift Serverless, Service Mesh 2, and standalone Authorino operators were dependencies of the 2.x KServe Serverless stack. With that stack removed, uninstall them. Removing their subscriptions and CSVs is enough.
+ModelMesh is *multi-model serving* -one ServingRuntime hosts many models, keyed by a storage path. 3.x has no ModelMesh, so the model must be re-deployed as a *single-model* KServe RawDeployment ISVC backed by a single-model ServingRuntime.
+
+Inspect the ModelMesh ISVC and its multi-model runtime:
 
 [.console-input]
 [source,role="execute"]
 ----
-# Standalone Authorino (came in with Serverless)
-oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+oc get isvc my-modelmesh-isvc -n ml-project-c -o yaml | yq '.spec'
+echo "--- multi-model ServingRuntime ---"
+oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='multiModel={.spec.multiModel}{"\n"}'
+----
 
-# OpenShift Serverless
-oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+[.console-output]
+----
+predictor:
+  model:
+    modelFormat:
+      name: onnx
+      version: "1"
+    runtime: ovms-mm
+    storage:
+      key: pvc-models
+      path: mobilenet
+--- multi-model ServingRuntime ---
+multiModel=true
+----
 
-# Service Mesh 2 (safe now that the SMCP and SMMR are gone)
-oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+This is a MobileNetV2 image classifier in *ONNX* format, served by OpenVINO Model Server (OVMS) in ModelMesh multi-model mode. The model lives on a PVC (`model-store`) under the OVMS layout `mobilenet/1/`. To migrate it you re-deploy the *same model* on a *single-model* OVMS ServingRuntime as a KServe RawDeployment ISVC, pointing `storageUri` at the same PVC path. ONNX is a first-class format for both ModelMesh OVMS and single-model KServe OVMS, so this is a true re-host -no model conversion, no data movement.
+
+Confirm the model file is present on the PVC:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n ml-project-c get pvc model-store -o jsonpath='PVC: {.status.phase}{"\n"}'
 ----
 
 === Verify
@@ -311,31 +173,187 @@ oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | 
 [.console-input]
 [source,role="execute"]
 ----
-oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
-echo "--- check complete ---"
+oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='{.spec.multiModel}{"\n"}'
 ----
 
-[.console-output]
+✓ Output is `true` -confirming this is a ModelMesh multi-model runtime
+
+== Exercise 2.5: Re-host the model on KServe RawDeployment
+
+The model-store PVC is `ReadWriteOnce` (the default on `gp3-csi` and most cloud block-storage classes). RWO means only *one* node can attach the volume at a time. The ModelMesh runtime pod currently holds it; if you create the new KServe RawDeployment ISVC while ModelMesh is still running, the new predictor pod is very likely to land on a *different* node and hang with:
+
 ----
---- check complete ---
+Multi-Attach error for volume "pvc-...": Volume is already used by pod(s) modelmesh-serving-ovms-mm-...
 ----
 
-✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
-
-== Exercise 2.9: Re-run the assessment
-
-With every blocker resolved, re-run the lint to confirm the cluster is ready. Re-running between phases matters -some checks only clear once prior steps are done.
+Release the PVC first by scaling the ModelMesh ServingRuntime to zero. The ISVC stays — you'll delete it cleanly in Exercise 2.6 — but its pod is gone, so the volume detaches and the new KServe pod can mount it on whatever node it's scheduled to.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.2 | grep -E 'blocking|✗' || echo "No blocking findings remain"
+oc -n ml-project-c patch servingruntime ovms-mm --type=merge -p '{"spec":{"replicas":0}}'
+----
+
+Wait for the ModelMesh pod to terminate so the PVC actually detaches:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n ml-project-c wait --for=delete pod -l name=modelmesh-serving-ovms-mm --timeout=120s
+----
+
+[NOTE]
+====
+On a `ReadWriteMany` (RWX) storage class -EFS, CephFS, NFS -multiple nodes can attach the same volume at once and this scale-down is not strictly required. The lab uses RWO because it's the default on AWS gp3, so this step is what makes the migration work on the lab's storage class.
+====
+
+Now create a *single-model* OVMS ServingRuntime and a RawDeployment ISVC that reads the same ONNX model from the same PVC. Apply both:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: ovms-raw
+  namespace: ml-project-c
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "OVMS single-model (KServe)"
+spec:
+  multiModel: false
+  supportedModelFormats:
+    - name: onnx
+      version: "1"
+      autoSelect: true
+  protocolVersions:
+    - v2
+    - grpc-v2
+  containers:
+    - name: kserve-container
+      image: openvino/model_server:latest
+      args:
+        - --model_name={{.Name}}
+        - --model_path=/mnt/models
+        - --port=8001
+        - --rest_port=8888
+        - --file_system_poll_wait_seconds=0
+        - --target_device=CPU
+      ports:
+        - containerPort: 8888
+          protocol: TCP
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+---
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: mobilenet-onnx
+  namespace: ml-project-c
+  annotations:
+    serving.kserve.io/deploymentMode: "RawDeployment"
+    openshift.io/display-name: mobilenet-onnx
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  predictor:
+    minReplicas: 1
+    model:
+      modelFormat:
+        name: onnx
+        version: "1"
+      runtime: ovms-raw
+      storageUri: pvc://model-store/mobilenet
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+EOF
+----
+
+Wait for the new RawDeployment ISVC to come up (the storage-initializer copies the model from the PVC, then OVMS loads it):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc mobilenet-onnx -n ml-project-c \
+  -o custom-columns='NAME:.metadata.name,MODE:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+----
+
+Re-run until `READY` is `True`.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc mobilenet-onnx -n ml-project-c -o jsonpath='mode={.status.deploymentMode} ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
 ----
 
 [.console-output]
 ----
-No blocking findings remain
+mode=RawDeployment ready=True
+----
+
+✓ The migrated `mobilenet-onnx` ISVC is serving on RawDeployment
+
+== Exercise 2.6: Remove the ModelMesh ISVC and runtime
+
+With the model now re-hosted on RawDeployment -and the ModelMesh runtime already scaled to zero in Exercise 2.5 -remove the old ModelMesh ISVC and its multi-model runtime (the runtime only after no ISVC references it):
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete isvc my-modelmesh-isvc -n ml-project-c
+oc delete servingruntime ovms-mm -n ml-project-c
+----
+
+=== Verify
+
+No multi-model ServingRuntime and no ModelMesh ISVC should remain anywhere:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get servingruntime -A -o json | jq -r '.items[] | select(.spec.multiModel==true) | "\(.metadata.namespace)/\(.metadata.name)"'
+oc get isvc -A -o json | jq -r '.items[] | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") == "ModelMesh" or (.status.deploymentMode // "") == "ModelMesh") | "\(.metadata.namespace)/\(.metadata.name)"'
+echo "--- both queries above should be empty ---"
+----
+
+[.console-output]
+----
+--- both queries above should be empty ---
+----
+
+✓ No multi-model ServingRuntimes and no ModelMesh ISVCs remain -the model now serves only on RawDeployment
+
+== Exercise 2.7: Confirm every model is RawDeployment
+
+Before you move on, confirm the cluster's entire serving surface is RawDeployment and healthy. You should see all four models -the two converted LLMs, the re-hosted ONNX classifier, and the already-RawDeployment ISVC that needed no work:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,STATUS:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+----
+
+[.console-output]
+----
+NS               NAME                 MODE            STATUS          READY
+ml-project-a     my-serverless-isvc   RawDeployment   RawDeployment   True
+ml-project-b     another-sl-model     RawDeployment   RawDeployment   True
+ml-project-c     mobilenet-onnx       RawDeployment   RawDeployment   True
+ml-project-raw   tinyllama-1b-cpu     RawDeployment   RawDeployment   True
 ----
 
 === Verify
@@ -343,37 +361,41 @@ No blocking findings remain
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='{.status.phase}{"\n"}'
+oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") != "RawDeployment")] | length'
 ----
 
-✓ DSC is still `Ready`, and the assessment reports no blocking findings
+[.console-output]
+----
+0
+----
+
+✓ Zero non-RawDeployment ISVCs remain -all four models are on RawDeployment and the serving surface is safe to disable Serverless and ModelMesh
 
 == Troubleshooting
 
-*Issue*: `oc delete smmr` hangs.
+*Issue*: `oc apply` of the recreated ISVC fails with a `deploymentMode` webhook error.
 
-*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Make sure you delete the SMMR *before* uninstalling the operator in Exercise 2.8. If you already uninstalled it, reinstall the operator briefly so the finalizer can be processed, then delete the SMMR.
+*Solution*: Confirm you edited the *backup file* annotation to `RawDeployment` (Exercise 2.2 step 2) and that you deleted the old ISVC before re-applying. The webhook only blocks *changing* mode on an existing object; a fresh create with `RawDeployment` is accepted.
 
-*Issue*: KServe Serverless teardown (Exercise 2.6) seems stuck.
+*Issue*: The recreated ISVC sits `READY=False` for several minutes.
 
-*Solution*: It can take 5-10 minutes. Watch `oc get pods -n knative-serving` -the pod count should fall to zero. If `knativeserving` never drains, check the KServe controller logs with `oc logs -n redhat-ods-applications -l app=kserve-controller-manager`.
+*Solution*: RawDeployment pulls and loads the model fresh. Watch the predictor pod: `oc get pods -n <ns> -l serving.kserve.io/inferenceservice=<name>`. A CPU model can take a few minutes. Check pod logs if it never becomes ready.
 
-*Issue*: A DSC component won't move to `Removed`.
+*Issue*: You can't delete the multi-model ServingRuntime -"still in use".
 
-*Solution*: Confirm you patched the correct resource path. Use `oc get dsc default-dsc -o yaml | grep -A1 <component>` to inspect the current state, and remember `codeflare` and `ray` are separate fields.
+*Solution*: Delete the ModelMesh ISVC first (Exercise 2.5). The runtime can only be removed once no ISVC references it.
 
 == Learning outcomes
 
-You've completed the remediation phase. You can:
+You've completed the conversion phase. You can:
 
-* [x] Flip the removed DSC components to `Removed` in the correct order
-* [x] Patch the `inferenceservice-config` ConfigMap to protect running models
-* [x] Stop all workbenches before the upgrade
-* [x] Remove the Service Mesh dependency including the lingering member roll
-* [x] Uninstall the 2.x serving operators and confirm a clean assessment
+* [x] Enumerate InferenceServices by deployment mode
+* [x] Convert Serverless ISVCs to RawDeployment with backup-and-recreate
+* [x] Migrate a ModelMesh model off multi-model serving
+* [x] Confirm the entire serving surface is RawDeployment and Ready
 
 == Module summary
 
-The cluster is now in a pre-upgrade-clean state: every removed component is `Removed`, the Service Mesh dependency is gone, workbenches are stopped, and the assessment reports no blockers. In the next module you'll switch the operator subscription to the migration channel and drive the upgrade to {target-version}.
+Every model now runs on KServe RawDeployment -the only serving mode 3.x supports. Because no workload depends on Serverless or ModelMesh anymore, it's finally safe to disable those components. In the next module you'll do the platform remediation: flip the removed components to `Removed`, patch the model-serving ConfigMap, tear down the Service Mesh dependency, and uninstall the 2.x operators.
 
-Continue to *Module 3: Perform the upgrade*.
+Continue to *Module 3: Remediate the platform*.
