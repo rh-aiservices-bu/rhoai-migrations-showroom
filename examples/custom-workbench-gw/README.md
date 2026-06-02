@@ -21,9 +21,12 @@ The 2.x BYON image was the upstream community SciPy notebook (`quay.io/jupyter/s
 ## Build and push
 
 ```sh
-podman build -t quay.io/<org>/custom-scipy-notebook-gw:3.x -f Containerfile .
+podman build --platform linux/amd64 \
+  -t quay.io/<org>/custom-scipy-notebook-gw:3.x -f Containerfile .
 podman push  quay.io/<org>/custom-scipy-notebook-gw:3.x
 ```
+
+`--platform linux/amd64` is required — the lab clusters are amd64, and without it a build on Apple Silicon produces an arm64 image that fails on the cluster with `exec /usr/bin/tini: Exec format error`. See [../README.md](../README.md) for the full build-and-push guide (including multi-arch).
 
 Then update the lab's image reference in one place — `content/antora.yml`:
 

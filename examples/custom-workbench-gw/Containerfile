@@ -13,8 +13,12 @@
 #      prefix the notebook controller passes in NB_PREFIX, so the workbench works
 #      behind Gateway API path-based routing.
 #
-# Build and push (this is what produced the lab's gw-workbench-image):
-#   podman build -t quay.io/<org>/custom-scipy-notebook-gw:3.x -f Containerfile .
+# Build and push (this is what produced the lab's gw-workbench-image). The
+# --platform linux/amd64 flag is required: lab clusters are amd64, and a default
+# build on Apple Silicon produces an arm64 image that fails on the cluster with
+# `exec /usr/bin/tini: Exec format error`.
+#   podman build --platform linux/amd64 \
+#     -t quay.io/<org>/custom-scipy-notebook-gw:3.x -f Containerfile .
 #   podman push  quay.io/<org>/custom-scipy-notebook-gw:3.x
 #
 # Production note: for a fully supported image, rebase on a Red Hat UBI9 + Python
