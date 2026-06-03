@@ -23,13 +23,17 @@ This workshop assumes you already have:
 * Backup and restore (a real migration requires a verified backup first; that is out of scope here)
 * Rolling back a failed migration
 
-== Accessing your environment
+== Log in to the cluster
 
-You have been provided with an OpenShift cluster that already runs OpenShift AI {source-version}. Every command in this workshop runs from *Terminal 1* in the panel on the right.
+Every command in this workshop runs from *Terminal 1* in the panel on the right. Log in to the cluster as `cluster-admin` using the API server URL and credentials supplied by your lab environment:
 
-=== Log in as cluster admin
+[.console-input]
+[source,role="execute"]
+----
+oc login -u <admin-user> -p <admin-password> <api-server-url>
+----
 
-Confirm you're authenticated to the cluster with `cluster-admin` privileges:
+Confirm the session has `cluster-admin` privileges:
 
 [.console-input]
 [source,role="execute"]
@@ -38,28 +42,7 @@ oc whoami
 oc auth can-i '*' '*' --all-namespaces
 ----
 
-You should see your username and `yes`. If `oc whoami` returns an error or the auth check returns `no`, log in as cluster admin with the credentials supplied by your lab environment:
-
-[.console-input]
-[source,role="execute"]
-----
-oc login -u <admin-user> -p <admin-password> <api-server-url>
-----
-
-=== Find the OpenShift AI dashboard URL
-
-Before the upgrade the dashboard is served from an OpenShift Route. Discover it from the cluster:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}{"\n"}'
-----
-
-[NOTE]
-====
-After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.<cluster-ingress-domain>`. You'll discover the new URL -and the matching change to model endpoint URLs -in Module 7.
-====
+You should see your username and `yes`. If the auth check returns `no`, log out and log back in with a cluster-admin account before continuing.
 
 == The starting cluster
 
