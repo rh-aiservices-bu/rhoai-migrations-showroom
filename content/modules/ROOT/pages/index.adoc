@@ -25,34 +25,41 @@ This workshop assumes you already have:
 
 == Accessing your environment
 
-You have been provided with an OpenShift cluster that already runs OpenShift AI {source-version}. Use the following credentials to access it.
+You have been provided with an OpenShift cluster that already runs OpenShift AI {source-version}. Every command in this workshop runs from *Terminal 1* in the panel on the right.
 
-=== OpenShift console
+=== Log in as cluster admin
 
-* *Console URL:* link:{openshift_console_url}[{openshift_console_url}^]
-* *Username:* {openshift_cluster_admin_username}
-* *Password:* {openshift_cluster_admin_password}
-
-=== OpenShift AI dashboard (pre-upgrade)
-
-Before the upgrade, the dashboard is served from an OpenShift Route:
-
-* *RHOAI URL:* link:https://rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}[https://rhods-dashboard-redhat-ods-applications.{openshift_cluster_ingress_domain}^]
-
-[NOTE]
-====
-After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You'll confirm this -and the matching change to model endpoint URLs -in Module 7.
-====
-
-=== Command line
-
-Use *Terminal 1* in the panel on the right for every command in this workshop. Confirm you are logged in:
+Confirm you're authenticated to the cluster with `cluster-admin` privileges:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc whoami
+oc auth can-i '*' '*' --all-namespaces
 ----
+
+You should see your username and `yes`. If `oc whoami` returns an error or the auth check returns `no`, log in as cluster admin with the credentials supplied by your lab environment:
+
+[.console-input]
+[source,role="execute"]
+----
+oc login -u <admin-user> -p <admin-password> <api-server-url>
+----
+
+=== Find the OpenShift AI dashboard URL
+
+Before the upgrade the dashboard is served from an OpenShift Route. Discover it from the cluster:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}{"\n"}'
+----
+
+[NOTE]
+====
+After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.<cluster-ingress-domain>`. You'll discover the new URL -and the matching change to model endpoint URLs -in Module 7.
+====
 
 == The starting cluster
 
