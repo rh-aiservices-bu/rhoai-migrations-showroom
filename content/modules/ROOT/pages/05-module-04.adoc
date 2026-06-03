@@ -1,259 +1,662 @@
-= Module 4: Handle the workbench images
+= Module 4: Remediate the platform
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-The last thing to handle before the upgrade is the workbenches. RHOAI 3.x changes the workbench authentication model (oauth-proxy to kube-rbac-proxy) and routing (Routes to Gateway API). Out-of-the-box images are bumped by the operator, but *custom* (BYON) images and out-of-date image tags need attention -and you have both on this cluster.
+With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path, so the action is delete pre-upgrade and recreate fresh post-upgrade (data archival is out of scope here). This module starts with backups, deletes the LSDs, then runs the disables, then the 3.x prerequisites, then operator uninstalls.
 
-In this module you'll discover the custom image, learn exactly what has to change to make a custom image work in 3.x, swap in a pre-built image that already has those changes, bump out-of-date tags, then stop every workbench so it's ready for the upgrade.
+In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 7, update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, install Red Hat Connectivity Link (RHCL) as the 3.x llm-d auth plane, freeze the LLMInferenceService templates, and finally uninstall the 2.x serving operators.
+
+Order matters throughout. Back up RayClusters *before* disabling Ray. The `inferenceservice-config` ConfigMap must be updated *after* every ISVC is RawDeployment but *before* the disables, so the upgrade reconciler honours the new ignorelist. KServe Serverless must drain before you remove the Service Mesh v2 dependency. The Service Mesh member roll has to be deleted before its operator can be uninstalled. And RHCL must be up *before* you uninstall the standalone Authorino, or LLMInferenceService loses auth for the duration of the window.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Discover custom (BYON) workbench images registered in the dashboard
-* Describe the Dockerfile and configuration changes a custom image needs for 3.x
-* Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
-* Bump out-of-date image tags and stop every workbench before the upgrade
+* Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs ahead of destructive component changes, and delete any LlamaStackDistributions
+* Update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist
+* Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`
+* Remove the Service Mesh v2 dependency including the lingering member roll
+* Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
+* Freeze the LLMInferenceService scheduler/router templates against the 3.x rewrite
+* Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
 
-== Exercise 4.1: Discover the custom workbench image
+== Exercise 4.1: Back up the RayClusters
 
-List the custom (BYON) ImageStreams registered through the dashboard:
+The `codeflare` operator is removed in 3.x; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields. Run this *before* Exercise 4.7 — the helper requires CodeFlare to still be installed.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get imagestream -n redhat-ods-applications -l app.kubernetes.io/created-by=byon \
-  -o custom-columns='NAME:.metadata.name,URL:.metadata.annotations.opendatahub\.io/notebook-image-url'
+oc exec -n rhai-migration rhai-cli-0 -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py pre-upgrade
+
+oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/ray ./ray-backup
+----
+
+✓ `./ray-backup/rhoai-2.x/` and `./ray-backup/rhoai-3.x/` each contain one YAML per RayCluster. `oc get raycluster -A` still shows both clusters `ready`.
+
+== Exercise 4.2: Back up TrustyAI metrics and data
+
+TrustyAI's storage schema changed between 2.x and 3.x. Historical bias-detection metrics and training data can become unreadable without a pre-upgrade snapshot. Capture both before anything else touches the component.
+
+Confirm TrustyAI is `Managed` (skip the rest of this exercise if not):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='trustyai={.spec.components.trustyai.managementState}{"\n"}'
+oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STORAGE:.spec.storage.format'
+----
+
+Per the migration guide, metrics are backed up with a per-namespace port-forward + `curl` (no helper script for metrics), and data storage is backed up with the official `backup-data.sh` helper (auto-detects PVC vs DATABASE). Run both for each namespace that has a TrustyAIService.
+
+Run the metrics + data backup for *both* TrustyAI service namespaces (`test-trustyaiservice` and `test-trustyaiservice-db`). The block below sets `BACKUP_DIR` explicitly -the rhai-cli image doesn't always set it for non-login shells, and an unset `BACKUP_DIR` makes `curl -o "${BACKUP_DIR}/..."` silently write to `/trustyai-metrics-*.json` at the filesystem root where the cleanup tooling won't find it.
+
+[.console-input]
+[source,role="execute"]
+----
+for NS in test-trustyaiservice test-trustyaiservice-db; do
+  echo "=== Backing up $NS ==="
+  oc exec -n rhai-migration rhai-cli-0 -it -- bash -c "
+    set -e
+    export BACKUP_DIR=/tmp/rhoai-upgrade-backup/trustyai
+    mkdir -p \"\$BACKUP_DIR\"
+    export NS=$NS
+    export TAS_NAME=\$(oc get trustyaiservice -n \"\$NS\" -o jsonpath='{.items[0].metadata.name}')
+    export SVC_PORT=\$(oc get svc -n \"\$NS\" \"\$TAS_NAME\" -o jsonpath='{.spec.ports[?(@.name==\"http\")].port}')
+    echo \"[INFO] NS=\$NS TAS=\$TAS_NAME PORT=\$SVC_PORT\"
+    # Metrics: port-forward + curl /metrics/all/requests
+    oc port-forward -n \"\$NS\" \"svc/\$TAS_NAME\" 8080:\${SVC_PORT} &
+    PF_PID=\$!; sleep 3
+    curl -sk -H \"Authorization: Bearer \$(oc whoami -t)\" \
+      http://localhost:8080/metrics/all/requests \
+      -o \"\${BACKUP_DIR}/trustyai-metrics-\${NS}-\$(date +%Y%m%d-%H%M%S).json\"
+    kill \$PF_PID 2>/dev/null || true
+    # Data: backup-data.sh auto-detects PVC vs DATABASE per TrustyAIService
+    cd /opt/rhai-upgrade-helpers/trustyai
+    ./backup-data.sh --namespace \"\$NS\"
+  "
+done
+----
+
+[NOTE]
+====
+On a fresh lab `backup-data.sh` may print `[WARN] PVC appears to be empty (0 files copied)` for `test-trustyaiservice` -no bias-detection has been run, so there's no input data. The backup still completes successfully. `test-trustyaiservice-db` produces a SQL dump (the `-db` suffix marks it as database-backed).
+====
+
+Outside the pod, capture any `GuardrailsOrchestrator` `spec.otelExporter` blocks so you can restore them post-upgrade (no helper script for this either):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get guardrailsorchestrator -A -o json \
+  | jq -r '.items[] | select(.spec.otelExporter != null) | {ns: .metadata.namespace, name: .metadata.name, otelExporter: .spec.otelExporter}' \
+  > /tmp/trustyai-guardrails-otel-backup-$(date +%Y%m%d%H%M).json
+----
+
+Copy the backup off the rhai-cli pod:
+
+[.console-input]
+[source,role="execute"]
+----
+oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/trustyai ./trustyai-backup
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- ls -la /tmp/rhoai-upgrade-backup/trustyai
+oc exec -n rhai-migration rhai-cli-0 -- find /tmp/rhoai-upgrade-backup/trustyai -maxdepth 2 -type f
 ----
 
 [.console-output]
 ----
-NAME                    URL
-custom-scipy-notebook   {legacy-workbench-image}
+trustyai-metrics-test-trustyaiservice-20260218-175450.json
+trustyai-metrics-test-trustyaiservice-db-20260218-175501.json
+trustyai-data-test-trustyaiservice-20260218-175451/data/...
+trustyai-db-test-trustyaiservice-db-20260218-175502/dump.sql
 ----
 
-The image is `{legacy-workbench-image}` -an upstream community Jupyter image, built well before RHOAI 3.x existed. It will not work as-is after the upgrade.
+✓ The backup directory lists one `trustyai-metrics-<ns>-*.json` per namespace, plus a `trustyai-data-<ns>-*/` (PVC) tree for the PVC-backed service and a `trustyai-db-<ns>-*/dump.sql` for the database-backed one
 
-=== Verify
+== Exercise 4.3: AI Pipelines pre-upgrade check
+
+DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and 3.3 -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. The rhai-cli helper does both jobs in one pass: snapshots every DSPA pod's health to disk (so `post_upgrade_check.sh` can diff against it in Module 8), then scans for deprecated APIs and custom RBAC roles.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
-  -o jsonpath='{.spec.tags[0].from.name}{"\n"}'
-----
-
-✓ The ImageStream points at the legacy community image
-
-== Exercise 4.2: Why this image breaks in 3.x
-
-A custom workbench image built for 2.x makes two assumptions that 3.x breaks:
-
-. *Authentication.* In 2.x, each workbench pod ran an `oauth-proxy` sidecar tightly coupled to the internal OpenShift OAuth server. In 3.x, the platform injects `kube-rbac-proxy` instead. An image that bakes in oauth-proxy configuration fights the platform and produces redirect loops.
-. *Routing.* In 2.x, workbenches were exposed through OpenShift Routes. In 3.x they're exposed through Kubernetes Gateway API with *path-based* routing, where every workbench lives under a path prefix carried in the `NB_PREFIX` environment variable. An image whose web server ignores `NB_PREFIX` -or strips it from redirects -produces "page not found" once it's behind the Gateway.
-
-The fix is a *rebuild* of the image, not a configuration tweak on the cluster. Red Hat does not auto-rebuild custom images -this is an application-owner task.
-
-== Exercise 4.3: How the image was updated for 3.x
-
-For this workshop the rebuild has already been done for you and pushed to a registry. Before you use it, understand what changed -so you can do the same for your own images.
-
-The 3.x-ready image was produced by rebuilding the original Dockerfile with these changes:
-
-. *Remove the oauth-proxy sidecar and its config.* 3.x injects `kube-rbac-proxy` at the platform level. Any `oauth-proxy` binary, config, or sidecar wiring in the image is deleted -the image only needs to serve the notebook on its own port.
-. *Honor `NB_PREFIX` for all routing.* The notebook server must serve under the path prefix the controller passes in `NB_PREFIX` and must not strip it from redirects. For a Jupyter-based image this means launching with the prefix as the base URL:
-+
-[source,dockerfile]
-----
-# Jupyter respects NB_PREFIX natively when it is used as the base URL.
-# The start script must pass it through, e.g.:
-#   jupyter lab --ServerApp.base_url="${NB_PREFIX}" ...
-# Do NOT hardcode base_url or rewrite redirects without the prefix.
-----
-. *Base on a supported UBI9 / Python layer.* Rebuild on a current `registry.redhat.io` UBI9 base compatible with the 3.x notebook controller, rather than the upstream community base.
-. *Tag and push as a new image.* By convention, append `-gw` ("gateway-ready") so the new and old images are distinguishable. This was already done for this lab -shown here for reference only, do not run it:
-+
-[source,bash]
-----
-podman build -t {gw-workbench-image} -f Dockerfile.gw .
-podman push {gw-workbench-image}
-----
-
-[NOTE]
-====
-Two NGINX-based images (code-server, RStudio) have well-known `-gw` rebuild bugs worth knowing about:
-
-* A redirect that drops `NB_PREFIX` produces 404s -keep `NB_PREFIX` in every `Location:` header.
-* An `/api` endpoint that returns 403 because of a `SCRIPT_FILENAME` resolution issue -revert `/api` to a 302 redirect rather than an inline rewrite.
-
-Jupyter-based images (like this SciPy notebook) are simpler because Jupyter honors `NB_PREFIX` natively -the main work is removing oauth-proxy and rebasing.
-====
-
-The result is published at:
-
-[.console-input]
-[source,role="execute"]
-----
-echo "{gw-workbench-image}"
-----
-
-[TIP]
-====
-The complete source for this rebuilt image -the `Containerfile` and the `NB_PREFIX`-aware entrypoint script -is included in the workshop repository under `examples/custom-workbench-gw/`. Use it as a starting template when you rebuild your own custom images.
-====
-
-== Exercise 4.4: Re-register the ImageStream with the 3.x-ready image
-
-Point the custom ImageStream at the rebuilt image so any workbench created from it uses the 3.x-compatible version. Import the new image as a tag:
-
-[.console-input]
-[source,role="execute"]
-----
-oc tag {gw-workbench-image} \
-  custom-scipy-notebook:3.x \
-  -n redhat-ods-applications \
-  --reference-policy=local
-----
-
-Update the BYON registration annotation so the dashboard shows the new image URL:
-
-[.console-input]
-[source,role="execute"]
-----
-oc annotate imagestream custom-scipy-notebook -n redhat-ods-applications \
-  opendatahub.io/notebook-image-url="{gw-workbench-image}" --overwrite
-----
-
-[NOTE]
-====
-If the custom image is hosted in the cluster's internal registry, the workbench pod's service account needs `system:image-puller` for the `redhat-ods-applications` namespace. The `--reference-policy=local` flag pins the ImageStream to the local registry so it resolves there rather than re-fetching from the source registry on every pull.
-====
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
-  -o jsonpath='{range .status.tags[*]}{.tag}{"\n"}{end}'
-----
-
-✓ A `3.x` tag now exists on the `custom-scipy-notebook` ImageStream
-
-== Exercise 4.5: Bump out-of-date image tags
-
-Some out-of-the-box images break on old tags under 3.x. The most common is `code-server`, which must be on the `2025.2` tag. Find any workbench on an older tag:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get notebooks -A -o json | jq -r '.items[]
-  | select(.spec.template.spec.containers[0].image | test("code-?server"))
-  | "\(.metadata.namespace)/\(.metadata.name)  \(.spec.template.spec.containers[0].image)"'
-----
-
-If any are on `2025.1` or older, bump them to `2025.2`:
-
-[.console-input]
-[source,role="execute"]
-----
-NS=<namespace>; NAME=<notebook>
-oc patch notebook "$NAME" -n "$NS" --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"image-registry.openshift-image-registry.svc:5000/redhat-ods-applications/code-server-notebook:2025.2"}]'
-----
-
-[NOTE]
-====
-RStudio workbenches are built per-cluster from a BuildConfig, must use the `latest` tag, and need a new build *after* the upgrade. Jupyter-based images are generally compatible, but bumping to `2025.2` is recommended.
-====
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get notebooks -A -o json | jq -r '.items[]
-  | select(.spec.template.spec.containers[0].image | test("code-?server"))
-  | "\(.metadata.name): \(.spec.template.spec.containers[0].image | split(":")[-1])"'
-----
-
-✓ Any code-server workbench is on tag `2025.2` (or there are none on this cluster)
-
-== Exercise 4.6: Stop every workbench
-
-All workbenches must be stopped before the upgrade -running workbenches built for the 2.x auth model hit redirect loops during the transition. The notebook controller treats the `kubeflow-resource-stopped` annotation as "stopped if present"; the dashboard sets it to a timestamp, so use one here.
-
-Survey what's running (by pod count, the reliable signal):
-
-[.console-input]
-[source,role="execute"]
-----
-for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
-  ns="${nb%/*}"; name="${nb##*/}"
-  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  [ "$pods" -gt 0 ] && echo "$nb has $pods pod(s) running"
-done
-----
-
-Stop every workbench:
-
-[.console-input]
-[source,role="execute"]
-----
-STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
-  ns="${row%/*}"; name="${row##*/}"
-  oc -n "$ns" annotate notebook "$name" \
-    kubeflow-resource-stopped="$STAMP" --overwrite
-done
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
-  ns="${nb%/*}"; name="${nb##*/}"
-  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  [ "$pods" -gt 0 ] && echo "$nb still has $pods pod(s)"
-done
-echo "survey complete"
+oc exec -n rhai-migration rhai-cli-0 -- \
+  bash /opt/rhai-upgrade-helpers/ai_pipelines/check_before_upgrade.sh
 ----
 
 [.console-output]
 ----
-survey complete
+################################################################################
+> Step 1: Pre-Upgrade DSPA Pod Health Check
+> State will be saved to: /tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json
+################################################################################
+
+> DSPA: sample-pipelines | Namespace: dspa-sample
+  Checking pods with prefix 'ds-pipeline-sample-pipelines'...
+    [OK]   ds-pipeline-sample-pipelines-68cf4767c-qsg9t (Running, Ready)
+  Checking pods with prefix 'mariadb-sample-pipelines'...
+    [OK]   mariadb-sample-pipelines-5f46c8cf79-pzfpl (Running, Ready)
+
+> Pre-upgrade state saved to: /tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json
+################################################################################
+> Pre-upgrade: All DSPA pods are healthy
+################################################################################
+################################################################################
+> Step 2: Checking for deprecated DSPA API versions and custom roles
+################################################################################
+################################################################################
+> No deprecated API versions or custom roles found. No need to do anything, proceed with your upgrade.
+################################################################################
 ----
 
-✓ No workbench reports running pods
+For this lab the check passes cleanly -nothing to remediate. On a production cluster the script may report:
+
+* *Warning: deprecated `instructLab` field* -safe to ignore; the field is tolerated during upgrade.
+* *Deprecated v1alpha1 DSPA found* -run the `update_dsp_role.sh` helper or follow migration guide §2.4 step 5 to update each CR.
+* *Custom RBAC roles detected (ArgoCD-managed)* -advisory only; leave as-is or update the GitOps source.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dspa -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,API:.apiVersion'
+oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ai_pipelines/
+----
+
+[.console-output]
+----
+NS            NAME               API
+dspa-sample   sample-pipelines   datasciencepipelinesapplications.opendatahub.io/v1
+dspa_pre_upgrade_pods.json
+----
+
+✓ The DSPA is at `apiVersion: …/v1` and `dspa_pre_upgrade_pods.json` is on disk for Module 8 to diff against
+
+== Exercise 4.4: Delete any Llama Stack distributions
+
+Llama Stack's 2→3 transition is "delete and replace." The schema changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. Archiving the in-pod data is out of scope for this workshop; if your LSD owner cares about telemetry/agent state, that's a separate conversation. For the migration itself, the action is just *delete*.
+
+If no LSDs are present, this exercise is a no-op. If any exist, delete them so the upgrade has a clean slate and the `llamastackdistribution / config` blocker clears:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llamastackdistribution -A
+oc get llamastackdistribution -A -o json \
+  | jq -r '.items[]? | "\(.metadata.namespace) \(.metadata.name)"' \
+  | while read NS NAME; do oc delete llamastackdistribution "$NAME" -n "$NS"; done
+----
+
+You'll deploy a fresh 3.x-shaped LSD in Module 7.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llamastackdistribution -A 2>&1 | tail -1
+----
+
+[.console-output]
+----
+No resources found
+----
+
+✓ All LSDs are deleted -the rhai-cli `llamastackdistribution / config` blocker is cleared
+
+== Exercise 4.5: Update the inferenceservice-config ConfigMap
+
+With every ISVC on RawDeployment (Module 3), apply the hardware-profile ignorelist changes to the `inferenceservice-config` ConfigMap. The official `hardwareprofiles-ignorelist.sh` helper does both jobs the migration guide §2.8.8 calls for: adds `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace` to the disallowed list (so the upgrade can migrate HardwareProfiles cleanly), and prevents InferenceService redeployment during the upgrade by marking the ConfigMap unmanaged.
+
+Back up first so you can restore the 2.x state if anything goes sideways:
+
+[.console-input]
+[source,role="execute"]
+----
+mkdir -p /tmp/rhoai-upgrade-backup
+oc get configmap inferenceservice-config -n redhat-ods-applications -o yaml \
+  > /tmp/rhoai-upgrade-backup/inferenceservice-config-backup.yaml
+ls -lh /tmp/rhoai-upgrade-backup/inferenceservice-config-backup.yaml
+----
+
+Then run the helper from inside the rhai-cli container:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/hardwareprofiles-ignorelist.sh \
+  -n redhat-ods-applications
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get configmap inferenceservice-config -n redhat-ods-applications \
+  -o yaml | grep "hardware" -B 2 -A 2
+oc get configmap inferenceservice-config -n redhat-ods-applications \
+  -o jsonpath='managed={.metadata.annotations.opendatahub\.io/managed}{"\n"}'
+----
+
+✓ The ConfigMap lists `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace` on the disallowed list, and `managed=false` so the upgrade reconciler honours the patch
+
+[NOTE]
+====
+A side effect of `managed=false` is that the upgrade will *not* redeploy your model-serving pods. They keep running on the same kserve runtime image they were on. If you wanted a fresh runtime image post-upgrade (for example to pick up a newer vLLM build), restart each predictor explicitly after Module 7 once the platform is healthy.
+====
+
+== Exercise 4.6: Disable Kueue
+
+Leaving Kueue `Managed` at upgrade time is the single highest-risk mistake -its admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster.
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kueue": { "managementState": "Removed" } } }
+}'
+----
+
+✓ `oc patch` reports `patched` -`kueue.managementState` is now `Removed`. The `KueueReady` DSC condition flips to `False / reason=Removed`, which is expected.
+
+== Exercise 4.7: Disable Ray and CodeFlare
+
+The DSC has *two* separate components, `codeflare` and `ray`, even though the rhai-cli reports the blocker under `ray/removal`. Flip both:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": {
+    "codeflare": { "managementState": "Removed" },
+    "ray":       { "managementState": "Removed" }
+  } }
+}'
+----
+
+✓ Both fields are `Removed`. KubeRay continues to manage existing RayClusters directly.
+
+== Exercise 4.8: Disable ModelMesh Serving
+
+You migrated the ModelMesh model in Module 3, so removing the component no longer affects a running model:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "modelmeshserving": { "managementState": "Removed" } } }
+}'
+----
+
+✓ ModelMesh controller pods in `redhat-ods-applications` will be gone within a minute.
+
+== Exercise 4.9: Disable KServe Serverless mode
+
+You converted both Serverless ISVCs in Module 3, so disabling Serverless mode no longer affects a running model. Set `serving` to `Removed` *and* the default mode to `RawDeployment` in one patch:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kserve": {
+    "serving": { "managementState": "Removed" },
+    "defaultDeploymentMode": "RawDeployment"
+  } } }
+}'
+----
+
+The Knative stack tears down over several minutes. Poll until drained:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get knativeserving -A
+----
+
+✓ Re-run until it reports `No resources found`. Then confirm all four models still serve:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+----
+
+✓ All four ISVCs still report `READY=True` -RawDeployment models don't depend on Knative
+
+== Exercise 4.10: Remove the Service Mesh dependency
+
+OpenShift 4.19+ handles service mesh internally, so RHOAI 3.x no longer needs the embedded one:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch dsci default-dsci --type=merge -p '{
+  "spec": { "serviceMesh": { "managementState": "Removed" } }
+}'
+----
+
+Poll for the SMCP to drain, then delete the leftover ServiceMeshMemberRoll (the DSCI change drains the SMCP but leaves the SMMR with a `maistra.io/istio-operator` finalizer that only the still-installed Service Mesh operator can clear):
+
+[.console-input]
+[source,role="execute"]
+----
+oc get smcp -A
+# Re-run until "No resources found", then:
+oc delete smmr default -n istio-system --ignore-not-found
+----
+
+✓ Both the SMCP and SMMR are gone. The Service Mesh operator itself is uninstalled in Exercise 4.13.
+
+== Exercise 4.11: Install Red Hat Connectivity Link for llm-d
+
+RHOAI 3.x routes LLMInferenceService (llm-d) traffic through Kubernetes Gateway API with *Red Hat Connectivity Link* (RHCL -upstream: Kuadrant) as the consolidated auth/policy plane. RHCL replaces the standalone Authorino that came in with the Serverless stack.
+
+Install RHCL *before* uninstalling the standalone Authorino (Exercise 4.13), or you'll drop auth for any LLMInferenceService for the duration of the window.
+
+=== Sub-step A: Install the RHCL operator (AllNamespaces, into `openshift-operators`)
+
+The RHCL operator must be installed *AllNamespaces*, with the Subscription in `openshift-operators`. The `kuadrant-system` namespace is created separately and used only for the Kuadrant CR + Authorino TLS resources -*not* for the Subscription.
+
+[IMPORTANT]
+====
+Earlier RHOAI 2.25 → 3.3 migration documentation directed installing RHCL into `kuadrant-system` with mode "A specific namespace on the cluster". That fails on RHCL v1.3.3:
+
+----
+phase: Failed
+reason: UnsupportedOperatorGroup
+message: OwnNamespace InstallModeType not supported, cannot configure to watch own namespace
+----
+
+The bundled `dns-operator` and `limitador-operator` CSVs Fail with the same error. Authorino's own CSV happens to succeed because Authorino does support OwnNamespace, but it's stranded without the rest of the bundle. RHCL v1.3.3 supports AllNamespaces only -install into `openshift-operators`.
+====
+
+[.console-input]
+[source,role="execute"]
+----
+oc create ns kuadrant-system 2>/dev/null || true
+
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata: { name: rhcl-operator, namespace: openshift-operators }
+spec:
+  channel: stable
+  name: rhcl-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+----
+
+`openshift-operators` ships an AllNamespaces OperatorGroup by default, so no OperatorGroup needs to be applied. Wait for the RHCL CSV (and the dns / limitador / authorino dependencies it pulls in) to reach `Succeeded`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n openshift-operators | grep -iE "rhcl|dns-operator|limitador|authorino"
+----
+
+Re-run until you see four `Succeeded` rows. Expected end state:
+
+[.console-output]
+----
+authorino-operator.v1.3.0     Authorino Operator                 1.3.0      authorino-operator.v1.2.4     Succeeded
+dns-operator.v1.3.0           DNS Operator                       1.3.0      dns-operator.v1.2.0           Succeeded
+limitador-operator.v1.3.0     Limitador Operator                 1.3.0      limitador-operator.v1.2.0     Succeeded
+rhcl-operator.v1.3.3          Red Hat Connectivity Link          1.3.3      rhcl-operator.v1.3.2          Succeeded
+----
+
+=== Sub-step B: Create the Kuadrant CR and enable TLS on Authorino
+
+Create the Kuadrant CR. RHCL provisions Authorino and Limitador in response:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata: { name: kuadrant, namespace: kuadrant-system }
+EOF
+----
+
+Check Kuadrant's current state:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.status.conditions}' | jq
+----
+
+Annotate the Authorino service so OpenShift's built-in service signer issues the listener cert (no cert-manager involved -OCP's internal CA mints `authorino-server-cert` automatically):
+
+[.console-input]
+[source,role="execute"]
+----
+oc annotate svc/authorino-authorino-authorization \
+  service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+  -n kuadrant-system
+
+sleep 2
+----
+
+Apply the Authorino CR with TLS on the **listener only** -the migration guide explicitly leaves `oidcServer.tls.enabled` *off*:
+
+[.console-input]
+[source,role="execute"]
+----
+oc apply -f - <<'EOF'
+apiVersion: operator.authorino.kuadrant.io/v1beta1
+kind: Authorino
+metadata:
+  name: authorino
+  namespace: kuadrant-system
+spec:
+  replicas: 1
+  clusterWide: true
+  listener:
+    tls:
+      enabled: true
+      certSecretRef:
+        name: authorino-server-cert
+  oidcServer:
+    tls:
+      enabled: false
+EOF
+
+oc wait --for=condition=ready pod -l authorino-resource=authorino -n kuadrant-system --timeout=150s
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n openshift-operators | grep -iE "rhcl|dns-operator|limitador|authorino"
+oc get authorino authorino -n kuadrant-system -o jsonpath='listener-tls={.spec.listener.tls.enabled} oidc-tls={.spec.oidcServer.tls.enabled}{"\n"}'
+oc get pods -n kuadrant-system -l authorino-resource=authorino
+oc get secret authorino-server-cert -n kuadrant-system
+----
+
+Expect: four `Succeeded` CSVs (`rhcl-operator`, `dns-operator`, `limitador-operator`, `authorino-operator`), `listener-tls=true oidc-tls=false`, one Authorino pod `Running 1/1`, the `authorino-server-cert` Secret present and minted by OpenShift's service signer.
+
+The real proof that this exercise is done is the rhai-cli lint:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
+  | grep -iE "kuadrant-readiness|authorino-tls-readiness"
+----
+
+✓ Every `kuadrant-readiness` and `authorino-tls-readiness` row is `✓ info` (Kuadrant installed and ready; Authorino TLS enabled with certificate secret `authorino-server-cert`). Kuadrant's CR may still report `Ready=False` -that's expected pre-upgrade; the lint only requires the resource to exist
+
+== Exercise 4.12: Freeze the LLMInferenceService template annotations
+
+Per migration guide §2.8.10.4, pin every LLMInferenceService to the 2.25 template names to prevent scheduler pod failures during the upgrade. The guide applies the pins on the `status` subresource (not `metadata.annotations`); the workshop does the same.
+
+Enumerate the LLMInferenceServices:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llminferenceservice -A
+----
+
+[.console-output]
+----
+NAMESPACE       NAME           URL   READY   REASON                       AGE
+llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
+----
+
+Apply the eight template pins to each LLMInferenceService (`llmisvc` is the short kind name):
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch llmisvc my-llm-model -n llm-project-a --subresource=status --type=merge -p '{
+  "status": {
+    "annotations": {
+      "serving.kserve.io/config-llm-template":                        "kserve-config-llm-template",
+      "serving.kserve.io/config-llm-decode-template":                 "kserve-config-llm-decode-template",
+      "serving.kserve.io/config-llm-worker-data-parallel":            "kserve-config-llm-worker-data-parallel",
+      "serving.kserve.io/config-llm-decode-worker-data-parallel":     "kserve-config-llm-decode-worker-data-parallel",
+      "serving.kserve.io/config-llm-prefill-template":                "kserve-config-llm-prefill-template",
+      "serving.kserve.io/config-llm-prefill-worker-data-parallel":    "kserve-config-llm-prefill-worker-data-parallel",
+      "serving.kserve.io/config-llm-scheduler":                       "kserve-config-llm-scheduler",
+      "serving.kserve.io/config-llm-router-route":                    "kserve-config-llm-router-route"
+    }
+  }
+}'
+----
+
+[NOTE]
+====
+On this cluster `my-llm-model` is `Ready=False` -that's a model-level health issue (typically a missing GPU resource or model artifact), not a migration concern. The template freeze applies regardless of whether the workload is currently serving; it pins the scheduler's behaviour for after the upgrade.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get llmisvc my-llm-model -n llm-project-a -o jsonpath='{.status.annotations}' | jq 'to_entries | map(select(.key | startswith("serving.kserve.io/config-llm-"))) | length'
+----
+
+[.console-output]
+----
+8
+----
+
+✓ All eight `serving.kserve.io/config-llm-*` annotations are pinned on the LLMInferenceService
+
+== Exercise 4.13: Uninstall the 2.x serving operators
+
+OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies of the 2.x KServe Serverless stack. With that stack removed -and RHCL up to take over auth -uninstall them.
+
+[.console-input]
+[source,role="execute"]
+----
+# Standalone Authorino: delete the Subscription only, do NOT delete the CSV.
+# Background (see IMPORTANT block below): RHCL is also installed into
+# openshift-operators, so OLM has deduped both Subscriptions to a single shared
+# authorino-operator CSV. Removing the CSV would tear down RHCL Authorino too.
+oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
+
+# OpenShift Serverless
+oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+
+# Service Mesh 2 (safe now that the SMCP and SMMR are gone)
+oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+----
+
+[IMPORTANT]
+====
+Since Exercise 4.11 installs RHCL into `openshift-operators` as well (AllNamespaces is the only mode RHCL v1.3.3 supports), the standalone Authorino Subscription and the RHCL Subscription both point at the same `authorino-operator` package -OLM has deduped them to a single `authorino-operator.v1.3.0` CSV. Deleting that CSV would break RHCL. The Subscription delete is enough: with the standalone Subscription gone, OLM keeps the CSV alive on RHCL's behalf, and RHCL's Authorino CR keeps serving LLMInferenceService auth.
+
+If you want to verify after the delete: `oc get csv -n openshift-operators | grep authorino` should still show `authorino-operator.v1.3.0  Succeeded`.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
+echo "--- check complete ---"
+----
+
+[.console-output]
+----
+--- check complete ---
+----
+
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
+
+== Exercise 4.14: Re-run the assessment
+
+Re-run the lint and confirm zero critical findings:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
+  | grep -E 'Total:|FAIL|PASS'
+----
+
+✓ `Failed: 0` and the DSC remains `Ready` -the cluster is upgrade-ready
 
 == Troubleshooting
 
-*Issue*: `oc tag` reports it can't reach the image.
+*Issue*: `oc delete smmr` hangs.
 
-*Solution*: Confirm the image URL is correct and public, or that the cluster has a pull secret for the registry. The lab image is published at `{gw-workbench-image}`. If it is in a private registry, add a pull secret to the `redhat-ods-applications` namespace first.
+*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Delete the SMMR *before* uninstalling the operator in Exercise 4.13. If you already uninstalled it, reinstall it briefly so the finalizer can process, then delete the SMMR.
 
-*Issue*: A workbench started from the custom image still hits a redirect loop in 3.x.
+*Issue*: Kuadrant CR is stuck at `Ready=False` with `MissingDependency` for a Gateway API provider.
 
-*Solution*: The image was not rebuilt correctly -confirm oauth-proxy is fully removed and the server honors `NB_PREFIX`. Use the rebuilt `-gw` image from Exercise 4.4, not the original.
+*Solution*: On a clean OCP 4.20+ cluster the Cluster Ingress Operator installs and manages `servicemeshoperator3` as the Gateway API provider -confirm with `oc get csv -n openshift-operators | grep servicemeshoperator3` (expect `Succeeded`). If the CSV is missing or `Failed` on a *disconnected* cluster, you skipped the §2.8.10.2 mirror step -mirror the SMv3 image into your registry and re-check. On a connected cluster a missing SMv3 CSV usually means the Cluster Ingress Operator itself is unhealthy; investigate `openshift-ingress-operator` before doing anything else.
 
-*Issue*: A workbench won't stop -its pod keeps coming back.
+*Issue*: `authorino-tls-readiness` still fails after Exercise 4.11.
 
-*Solution*: Confirm the annotation applied: `oc get notebook <name> -n <ns> -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}'`. The controller treats *any* non-empty value as stopped -use a timestamp, not the literal `true`.
+*Solution*: Confirm the `authorino-server-cert` Secret was minted by OpenShift's service signer: `oc get secret authorino-server-cert -n kuadrant-system`. If it's missing, the `service.beta.openshift.io/serving-cert-secret-name` annotation didn't take -re-run `oc annotate svc/authorino-authorino-authorization ...` from Sub-step B. The Authorino CR's `listener.tls.enabled` must be `true`; `oidcServer.tls.enabled` must stay `false` (the migration guide intentionally leaves it off).
+
+*Issue*: A converted model goes `READY=False` during the Serverless teardown.
+
+*Solution*: Check the predictor pod with `oc get pods -n <ns> -l serving.kserve.io/inferenceservice=<name>` and its logs. RawDeployment models do not depend on Knative, so the Serverless teardown itself shouldn't affect them; pod restarts later during the upgrade are expected (this is how they pick up the newer kserve and runtime images).
+
+*Issue*: KServe Serverless teardown seems stuck.
+
+*Solution*: It can take 5-10 minutes. Watch `oc get pods -n knative-serving` fall to zero. If it never drains, check `oc logs -n redhat-ods-applications -l app=kserve-controller-manager`.
 
 == Learning outcomes
 
-You've completed the workbench phase. You can:
+You've completed the platform remediation. You can:
 
-* [x] Discover BYON ImageStreams registered in the dashboard
-* [x] Describe the Dockerfile and config changes a custom image needs for 3.x
-* [x] Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
-* [x] Bump out-of-date tags and stop every workbench before the upgrade
+* [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
+* [x] Flip every removed component to `Removed` in the correct order
+* [x] Remove the Service Mesh v2 dependency including the lingering member roll
+* [x] Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
+* [x] Freeze every LLMInferenceService against the 3.x template rewrite
+* [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary
 
-The workbenches are handled: the custom image is re-registered to a 3.x-ready build, out-of-date tags are bumped, and every workbench is stopped. The cluster is fully pre-upgrade-clean -models converted, components removed, operators gone, images updated, workbenches stopped. It's time to upgrade.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, RHCL is up as the new llm-d auth plane, every LLMInferenceService is template-pinned, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
 
-Continue to *Module 5: Perform the upgrade*.
+Continue to *Module 5: Handle the workbench images*.

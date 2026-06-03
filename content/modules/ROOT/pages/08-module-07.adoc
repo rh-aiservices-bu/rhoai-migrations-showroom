@@ -1,0 +1,239 @@
+= Module 7: Post-upgrade verification
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+The operator is on {target-version} and the DSC is `Ready`, but the migration isn't finished. The 3.x reconciler needs a few helper scripts to bring components fully across (ConfigMap state, workbench auth, RayCluster CRs, GuardrailsOrchestrator schema). This module runs those scripts and then sweeps every workload to confirm they survived the upgrade.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Confirm the operator, DSC, and DSCI are healthy on {target-version}
+* Run the four required post-upgrade helper scripts (ConfigMap, workbenches, Ray, GuardrailsOrchestrator)
+* Verify every workload on the cluster is healthy and the rhai-cli lint is clean
+
+== Exercise 7.1: Confirm platform health
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
+oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}DSC version: {.status.release.version}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
+----
+
+[.console-output]
+----
+rhods-operator.3.3.3   Succeeded
+DSC: Ready
+DSC version: 3.3.3
+DSCI: Ready
+----
+
+✓ Operator on {target-version}, DSC + DSCI both `Ready`
+
+== Exercise 7.2: Restore the inferenceservice-config ConfigMap
+
+In Module 4 you marked `inferenceservice-config` as `managed=false` so the upgrade couldn't redeploy your ISVCs. With the operator on {target-version}, hand control back. The official `managed-inferenceservice-config.sh` helper restores the annotation, restarts the KServe controller, and verifies that no ISVC was silently redeployed (guide §4.9.1).
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-upgrade-helpers/model-serving/after-upgrade/managed-inferenceservice-config.sh \
+  -n redhat-ods-applications
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get configmap inferenceservice-config -n redhat-ods-applications \
+  -o jsonpath='managed={.metadata.annotations.opendatahub\.io/managed}{"\n"}'
+----
+
+✓ Output is `managed=true`
+
+== Exercise 7.3: Patch the workbenches onto the new auth model
+
+Workbenches still carry 2.x oauth-proxy configuration. Under 3.x they need kube-rbac-proxy or they hit redirect loops on first start. The `rhai-cli` helper patches each stopped workbench in place.
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh patch --only-stopped --with-cleanup -y
+'
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh list --all
+'
+----
+
+✓ Output reports `Legacy (2.x): 0` and `All workbenches have been migrated`
+
+[NOTE]
+====
+Custom workbench images that bake in oauth-proxy can't be fixed by this patch -they need an image rebuild against kube-rbac-proxy. The helper flags them; the rebuild is an application-owner task.
+====
+
+== Exercise 7.4: Migrate the RayClusters to KubeRay
+
+The CodeFlare operator is gone; KubeRay manages Ray clusters directly. Run the migration script (your pre-upgrade backups from Module 4 Exercise 4.1 are your safety net if anything breaks):
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -it -- \
+  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py post-upgrade
+----
+
+Answer `yes` at the prompt. Each migrated cluster restarts its head + worker pods.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get raycluster -A
+----
+
+✓ Every RayCluster reports `Status=ready` with workers available
+
+== Exercise 7.5: Patch GuardrailsOrchestrator
+
+Two official §4.6.2 helpers per GuardrailsOrchestrator: `patch-guardrails-deployment.sh` adds the missing ReadinessProbe; `migrate-gorch-otel-exporter.sh` rewrites the `spec.otelExporter` schema to 3.x. The loop runs both for every GORCH:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get guardrailsorchestrator -A -o json \
+  | jq -r '.items[]? | "\(.metadata.namespace) \(.metadata.name)"' \
+  | while read -r NS GORCH_NAME; do
+      echo "=== $NS/$GORCH_NAME ==="
+      oc exec -n rhai-migration rhai-cli-0 -- bash -c \
+        "cd /opt/rhai-upgrade-helpers/trustyai && ./patch-guardrails-deployment.sh --gorch-name $GORCH_NAME --namespace $NS --fix"
+      oc exec -n rhai-migration rhai-cli-0 -- bash -c \
+        "cd /opt/rhai-upgrade-helpers/trustyai && ./migrate-gorch-otel-exporter.sh --namespace $NS --fix"
+    done
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get guardrailsorchestrator -A
+----
+
+✓ Each GuardrailsOrchestrator eventually reaches a healthy state (may take 1-2 minutes for the deployment to roll)
+
+== Exercise 7.6: Confirm every workload survived
+
+Sweep every component that was running before the upgrade. All should be present and healthy on {target-version}.
+
+[.console-input]
+[source,role="execute"]
+----
+echo "--- InferenceServices (must be RawDeployment + Ready=True) ---"
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+
+echo ""
+echo "--- DSPAs (Ready=True) ---"
+oc get dspa -A -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) Ready=\((.status.conditions[]? | select(.type=="Ready") | .status))"'
+
+echo ""
+echo "--- KFTO PyTorchJobs (Running or Succeeded) ---"
+oc get pytorchjob -A
+
+echo ""
+echo "--- Feast Feature Stores (Ready) ---"
+oc get featurestores --all-namespaces
+
+echo ""
+echo "--- Model Registry pods (all Running) ---"
+oc get pods -n rhoai-model-registries
+
+echo ""
+echo "--- HardwareProfiles in 3.x API group ---"
+oc get hardwareprofiles.infrastructure.opendatahub.io -n redhat-ods-applications
+----
+
+Expect: 4 ISVCs `RawDeployment / True`, 1 DSPA `Ready=True`, 1 PyTorchJob `Running`, 1 Feature Store `Ready`, four Model Registry pods (`model-catalog`, `model-catalog-postgres`, `my-model-registry`, `my-model-registry-db`), the migrated HardwareProfiles in the new API group.
+
+[NOTE]
+====
+*Llama Stack* was deleted pre-upgrade (Module 4 Exercise 4.4) and isn't recreated for the lab. On production, deploy a fresh 3.x-schema LSD per namespace that needs it. *AI Pipelines* still uses `.spec.components.datasciencepipelines` on the DSC (the documented `aipipelines` rename hasn't shipped in {target-version}). *Model Registry* nav moved from *Models → Model registry* to *AI hub → Registry* -tell users.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length'
+----
+
+✓ Four ISVCs report `Ready=True`. The other resources above are present and healthy
+
+== Exercise 7.7: Final assessment
+
+Re-run the rhai-cli lint and confirm there are zero critical findings:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
+  | grep -E "critical|Total:|FAIL|PASS" \
+  || echo "no critical findings"
+----
+
+[.console-output]
+----
+  Total: 38 | Passed: 30 | Warnings: 8 | Failed: 0 | Prohibited: 0
+----
+
+✓ `Failed: 0` -the migration is clean on {target-version}
+
+== Troubleshooting
+
+*Issue*: A model returns `Ready=False` after the upgrade.
+
+*Solution*: Confirm Exercise 7.2 (ConfigMap restore) was applied before model verification. If the issue persists, check the predictor pod's `events` and `logs` (`oc get events -n <ns>`, `oc logs <pod>`).
+
+*Issue*: The Gateway dashboard URL doesn't resolve.
+
+*Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST is rejected: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
+
+*Issue*: `workbench-2.x-to-3.x-upgrade.sh list --all` reports `Failed: N`.
+
+*Solution*: Inspect each with `oc describe notebook <name> -n <ns>`. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
+
+== Learning outcomes
+
+You've completed the platform-side migration. You can:
+
+* [x] Confirm the operator, DSC, and DSCI are healthy on {target-version}
+* [x] Restore the `inferenceservice-config` ConfigMap to managed
+* [x] Patch workbenches onto kube-rbac-proxy
+* [x] Migrate RayClusters to KubeRay
+* [x] Patch GuardrailsOrchestrators with both official helpers
+* [x] Confirm every workload that was running pre-upgrade is healthy post-upgrade
+* [x] Drive the rhai-cli lint to `Failed: 0`
+
+== Module summary
+
+Platform-side, the cluster is fully migrated to {target-version}. The four ISVCs serve on RawDeployment through Gateway API, the workbenches are patched, RayClusters are on KubeRay, Guardrails are on the new schema, and the lint is clean. Module 8 closes the loop by running simple smoke tests on the user-visible workloads -inference, workbench access, pipelines, Ray jobs.
+
+Continue to *Module 8: Re-test the migrated workloads*.

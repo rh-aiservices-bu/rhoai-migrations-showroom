@@ -42,16 +42,25 @@ In the quay.io UI, create two **public** repositories under your org:
 
 (Public so the lab cluster can pull without configuring a pull secret. If you keep them private, add a pull secret to the workbench namespaces — see *Private registries* below.)
 
+> **Always pass `--platform linux/amd64`.** The lab clusters run on amd64 nodes. If you build on Apple Silicon (or any arm64 host) without this flag, podman produces an arm64 image and the workbench pod fails to start with:
+>
+> ```
+> exec container process `/usr/bin/tini`: Exec format error
+> ```
+>
+> The flag forces podman to emulate amd64 via QEMU so the resulting image runs on the cluster regardless of your build host. (See [Multi-arch](#multi-arch-optional) below if you also want a native arm64 variant for local dev.)
+
 ## 2. Build and push the 2.x image (before-upgrade)
 
 ```sh
 cd examples/custom-workbench-2x
 
 podman build \
-  -t quay.io/<org>/rhoai-workbench-2x:lab-4.2.5 \
+  --platform linux/amd64 \
+  -t quay.io/hayesphilip/rhoai-workbench-2x:lab-4.2.5 \
   -f Containerfile .
 
-podman push quay.io/<org>/rhoai-workbench-2x:lab-4.2.5
+podman push quay.io/hayesphilip/rhoai-workbench-2x:lab-4.2.5
 ```
 
 The tag `lab-4.2.5` mirrors the upstream base tag so you can tell at a glance what version of the SciPy notebook it's based on. You can also push a `:latest` if you want a floating tag.
@@ -62,10 +71,11 @@ The tag `lab-4.2.5` mirrors the upstream base tag so you can tell at a glance wh
 cd examples/custom-workbench-gw
 
 podman build \
-  -t quay.io/<org>/rhoai-workbench-gw:3.x \
+  --platform linux/amd64 \
+  -t quay.io/hayesphilip/rhoai-workbench-gw:3.x \
   -f Containerfile .
 
-podman push quay.io/<org>/rhoai-workbench-gw:3.x
+podman push quay.io/hayesphilip/rhoai-workbench-gw:3.x
 ```
 
 The `:3.x` tag signals this image is compatible with the 3.x line broadly. If you maintain it for a specific minor release later, tag accordingly (`:3.3`, `:3.4`, etc.).
@@ -73,11 +83,17 @@ The `:3.x` tag signals this image is compatible with the 3.x line broadly. If yo
 ## 4. Smoke-test the pushed images
 
 ```sh
-podman pull quay.io/<org>/rhoai-workbench-2x:lab-4.2.5
-podman pull quay.io/<org>/rhoai-workbench-gw:3.x
+podman pull --platform linux/amd64 quay.io/<org>/rhoai-workbench-2x:lab-4.2.5
+podman pull --platform linux/amd64 quay.io/<org>/rhoai-workbench-gw:3.x
+
+# Confirm each manifest is amd64 — should print "amd64".
+podman inspect quay.io/<org>/rhoai-workbench-2x:lab-4.2.5 --format '{{.Architecture}}'
+podman inspect quay.io/<org>/rhoai-workbench-gw:3.x       --format '{{.Architecture}}'
 ```
 
 Both should pull without auth. If you get `unauthorized: access to the requested resource is not authorized`, the quay.io repo is still private — flip it to public in the repo settings.
+
+If `Architecture` comes back as `arm64`, you built on Apple Silicon without `--platform linux/amd64` — rebuild with the flag and re-push, otherwise the workbench pod will crash with `Exec format error`.
 
 ## 5. Wire the new image URLs into the workshop
 
@@ -103,7 +119,7 @@ The starting cluster registers the 2.x image as a BYON ImageStream. Update [rhoa
 
 ## Multi-arch (optional)
 
-If you want both `amd64` and `arm64` (typical for the OpenShift workbench node pool plus Apple Silicon dev):
+The instructions above produce a single amd64 image, which is all the lab cluster needs. If you *also* want a native arm64 variant for local dev on Apple Silicon (faster iteration, no QEMU emulation), publish a multi-arch manifest:
 
 ```sh
 podman build --platform linux/amd64,linux/arm64 --manifest \
@@ -111,7 +127,7 @@ podman build --platform linux/amd64,linux/arm64 --manifest \
 podman manifest push quay.io/<org>/rhoai-workbench-2x:lab-4.2.5
 ```
 
-(Same shape for the `-gw` image.) Most lab clusters are amd64-only, so single-arch is fine unless you have a specific reason.
+(Same shape for the `-gw` image.) When pulled from the amd64 cluster, podman picks the amd64 variant automatically; when pulled locally on arm64, it picks arm64.
 
 ## Private registries
 

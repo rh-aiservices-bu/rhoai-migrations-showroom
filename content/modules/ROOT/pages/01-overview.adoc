@@ -14,7 +14,7 @@ Previous OpenShift AI version bumps were routine operator upgrades. The move to 
 * *Components are removed*: KServe Serverless mode, ModelMesh Serving, the embedded Kueue, and CodeFlare are all gone in 3.x. The embedded Service Mesh dependency is dropped. You cannot simply disable these -any workload running on them must be migrated off *first*, or it stops serving.
 * *Routing changes*: OpenShift Routes are replaced by Kubernetes Gateway API. Model endpoint URLs and the dashboard URL change.
 * *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched, and custom images rebuilt.
-* *Schema changes*: the DSC `datasciencepipelines` component is renamed to `aipipelines`, and HardwareProfiles move to a new API group with renamed objects.
+* *Schema changes*: HardwareProfiles move to a new API group with renamed objects. (Architectural notes also describe a future DSC `datasciencepipelines` → `aipipelines` rename; that rename has not shipped in {target-version} and the DSC schema still uses `datasciencepipelines`.)
 
 Because so much changes at once, *there is no automated rollback*. In production, the only way back is restoring from a verified backup. In this lab the cluster is disposable, so you'll focus on the migration mechanics.
 
@@ -31,16 +31,19 @@ The single most important idea in this workshop is *sequencing*. You must migrat
 
 Get the order wrong -disable a component while a workload still depends on it -and you lose a running model.
 
+This workshop is also bookended by *baseline* and *re-test* modules. Module 1 exercises every user-facing workload before you touch anything, saving the responses to disk. Module 8 re-runs the same tests against the migrated endpoints and diffs against that baseline. A migration that didn't break anything is one you can prove didn't break anything.
+
 == The assessment-driven workflow
 
-Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster and reports what must change. You'll run it, remediate the findings, re-run it between phases, and only upgrade once it's clean. A key lesson in Module 1: the assessment reports *incompatible* workloads and *removed* components -it is **not** a full inventory. Compatible workloads won't appear, so you'll always verify what's running directly.
+Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster and reports what must change. You'll run it, remediate the findings, re-run it between phases, and only upgrade once it's clean. A key lesson in Module 2: the assessment reports *incompatible* workloads and *removed* components -it is **not** a full inventory. Compatible workloads won't appear, so you'll always verify what's running directly.
 
 == Learning objectives
 
 By the end of this workshop you will be able to:
 
-* Run `rhai-cli lint` and distinguish blocking findings from advisory ones -and know its limits as an inventory
-* Convert Serverless InferenceServices to RawDeployment using the backup-and-recreate pattern the admission webhook forces
+* Capture a pre-migration baseline of every user-facing workload and diff against it post-upgrade
+* Run `rhai-cli lint` and distinguish critical findings from warnings -and know its limits as an inventory
+* Convert Serverless InferenceServices to RawDeployment using the migration guide's `serverless-to-raw.sh` helper
 * Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
 * Disable removed components in the correct order, and tear down the Service Mesh dependency cleanly
 * Discover and triage custom workbench images for the new auth and routing model
@@ -51,12 +54,14 @@ By the end of this workshop you will be able to:
 [cols="3,1",options="header"]
 |===
 | Module | Time
-| Module 1: Assess the cluster | 20 min
-| Module 2: Convert the model-serving workloads | 40 min
-| Module 3: Remediate the platform | 30 min
-| Module 4: Handle the workbench images | 25 min
-| Module 5: Perform the upgrade | 30 min
-| Module 6: Post-upgrade verification | 25 min
+| Module 1: Test the baseline workloads | 15 min
+| Module 2: Assess the cluster | 20 min
+| Module 3: Convert the model-serving workloads | 40 min
+| Module 4: Remediate the platform | 30 min
+| Module 5: Handle the workbench images | 25 min
+| Module 6: Perform the upgrade | 30 min
+| Module 7: Post-upgrade verification | 20 min
+| Module 8: Re-test the migrated workloads | 10 min
 | *Total* | *~2.5 hours*
 |===
 

@@ -1,401 +1,365 @@
-= Module 2: Convert the model-serving workloads
+= Module 2: Assess the cluster
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-This is the heart of the migration. Your cluster runs four models: two on KServe Serverless mode, one on ModelMesh, and one already on KServe RawDeployment. The first three are the work -both Serverless and ModelMesh are removed in 3.x, and if you disable those components while the models still depend on them, the models stop serving. The RawDeployment model is already 3.x-compatible and you leave it alone.
+Before you change anything, you need to know what the upgrade will break. Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster against a target version and reports every component, workload, and dependency that needs attention.
 
-So you convert *first*. In this module you'll convert the two Serverless InferenceServices to RawDeployment using the backup-and-recreate pattern the admission webhook forces, then migrate the ModelMesh model to a single-model KServe RawDeployment. Only after this is done -in Module 3 -will you disable the components.
+In this module you'll deploy the assessment tool, run it against your {source-version} cluster targeting {target-version}, learn to read the results, and -critically -learn why a clean assessment is *not* the same as an empty cluster.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Enumerate InferenceServices by deployment mode
-* Convert a Serverless ISVC to RawDeployment with backup-and-recreate (the webhook blocks in-place edits)
-* Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
-* Verify every model is RawDeployment and `Ready` before touching the components
+* Deploy and run the `rhai-cli` assessment tool against a live cluster
+* Read a `rhai-cli lint` report and identify blocking versus advisory findings
+* Inventory the model-serving and workbench workloads directly
+* Explain why the assessment is not a substitute for a workload inventory
 
-== Exercise 2.1: Enumerate what needs converting
+== Exercise 2.1: Confirm the starting state
 
-List every InferenceService that is *not* already RawDeployment:
+Confirm the cluster is on OpenShift AI {source-version} and the platform is healthy.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc -A -o json | jq -r '.items[]
-  | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") != "RawDeployment")
-  | "\(.metadata.namespace)\t\(.metadata.name)\t\(.metadata.annotations."serving.kserve.io/deploymentMode")"'
+oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
+oc get dsc default-dsc -o jsonpath='DSC phase: {.status.phase}{"\n"}'
+oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
 ----
 
 [.console-output]
 ----
-ml-project-a   my-serverless-isvc   Serverless
-ml-project-b   another-sl-model     Serverless
-ml-project-c   my-modelmesh-isvc    ModelMesh
+rhods-operator.2.25.6   Succeeded
+DSC phase: Ready
+DSCI phase: Ready
 ----
 
-Two Serverless and one ModelMesh -all three must be migrated. The already-RawDeployment ISVC (`tinyllama-1b-cpu` in `ml-project-raw`) is filtered out by the query above; it needs no work.
+✓ Operator `Succeeded` and DSC + DSCI `Ready` -the cluster is healthy and ready to assess
 
-=== Verify
+== Exercise 2.2: Deploy the assessment tool
+
+`rhai-cli` runs from a pod inside the cluster so it can read the OLM CSVs, the DSC/DSCI, and workload custom resources cluster-wide. Create a project and deploy it.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}={.metadata.annotations.serving\.kserve\.io/deploymentMode}{"\n"}{end}'
+oc new-project rhai-migration
 ----
-
-✓ You see two `Serverless` and one `ModelMesh` ISVC
-
-== Exercise 2.2: Convert the first Serverless ISVC
-
-[WARNING]
-====
-You cannot convert a Serverless ISVC with an in-place `oc patch`. The KServe admission webhook rejects it: `deploymentMode cannot be changed from 'Serverless' to 'RawDeployment'`. You must back up the spec, delete the ISVC, and recreate it with the new annotation.
-====
-
-Convert `my-serverless-isvc` in `ml-project-a`. First, back up the spec with server-managed fields stripped:
-
-[.console-input]
-[source,role="execute"]
-----
-NS=ml-project-a; NAME=my-serverless-isvc
-oc get isvc "$NAME" -n "$NS" -o yaml \
-  | yq eval 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)' - \
-  > "/tmp/isvc-${NS}-${NAME}.yaml"
-----
-
-Flip the deployment mode in the backup, delete the old ISVC, and recreate it:
-
-[.console-input]
-[source,role="execute"]
-----
-NS=ml-project-a; NAME=my-serverless-isvc
-yq -i '.metadata.annotations."serving.kserve.io/deploymentMode" = "RawDeployment"' "/tmp/isvc-${NS}-${NAME}.yaml"
-oc delete isvc "$NAME" -n "$NS"
-oc apply -f "/tmp/isvc-${NS}-${NAME}.yaml"
-----
-
-=== Verify
-
-Wait for the recreated ISVC to come back as RawDeployment and Ready (the model reloads, so give it a couple of minutes):
-
-[.console-input]
-[source,role="execute"]
-----
-oc get isvc my-serverless-isvc -n ml-project-a \
-  -o custom-columns='NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,STATUS:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
-----
-
-[.console-output]
-----
-NAME                 MODE            STATUS          READY
-my-serverless-isvc   RawDeployment   RawDeployment   True
-----
-
-✓ `MODE` and `STATUS` are both `RawDeployment` and `READY` is `True`
-
-== Exercise 2.3: Convert the second Serverless ISVC
-
-Repeat for `another-sl-model` in `ml-project-b`:
-
-[.console-input]
-[source,role="execute"]
-----
-NS=ml-project-b; NAME=another-sl-model
-oc get isvc "$NAME" -n "$NS" -o yaml \
-  | yq eval 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)' - \
-  > "/tmp/isvc-${NS}-${NAME}.yaml"
-yq -i '.metadata.annotations."serving.kserve.io/deploymentMode" = "RawDeployment"' "/tmp/isvc-${NS}-${NAME}.yaml"
-oc delete isvc "$NAME" -n "$NS"
-oc apply -f "/tmp/isvc-${NS}-${NAME}.yaml"
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get isvc -A -o json | jq -r '.items[]
-  | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") == "Serverless")
-  | "\(.metadata.namespace)/\(.metadata.name)"' || true
-echo "--- no Serverless ISVCs should be listed above ---"
-----
-
-[.console-output]
-----
---- no Serverless ISVCs should be listed above ---
-----
-
-✓ No Serverless ISVCs remain
-
-== Exercise 2.4: Understand the ModelMesh model
-
-ModelMesh is *multi-model serving* -one ServingRuntime hosts many models, keyed by a storage path. 3.x has no ModelMesh, so the model must be re-deployed as a *single-model* KServe RawDeployment ISVC backed by a single-model ServingRuntime.
-
-Inspect the ModelMesh ISVC and its multi-model runtime:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get isvc my-modelmesh-isvc -n ml-project-c -o yaml | yq '.spec'
-echo "--- multi-model ServingRuntime ---"
-oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='multiModel={.spec.multiModel}{"\n"}'
-----
-
-[.console-output]
-----
-predictor:
-  model:
-    modelFormat:
-      name: onnx
-      version: "1"
-    runtime: ovms-mm
-    storage:
-      key: pvc-models
-      path: mobilenet
---- multi-model ServingRuntime ---
-multiModel=true
-----
-
-This is a MobileNetV2 image classifier in *ONNX* format, served by OpenVINO Model Server (OVMS) in ModelMesh multi-model mode. The model lives on a PVC (`model-store`) under the OVMS layout `mobilenet/1/`. To migrate it you re-deploy the *same model* on a *single-model* OVMS ServingRuntime as a KServe RawDeployment ISVC, pointing `storageUri` at the same PVC path. ONNX is a first-class format for both ModelMesh OVMS and single-model KServe OVMS, so this is a true re-host -no model conversion, no data movement.
-
-Confirm the model file is present on the PVC:
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n ml-project-c get pvc model-store -o jsonpath='PVC: {.status.phase}{"\n"}'
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='{.spec.multiModel}{"\n"}'
-----
-
-✓ Output is `true` -confirming this is a ModelMesh multi-model runtime
-
-== Exercise 2.5: Re-host the model on KServe RawDeployment
-
-The model-store PVC is `ReadWriteOnce` (the default on `gp3-csi` and most cloud block-storage classes). RWO means only *one* node can attach the volume at a time. The ModelMesh runtime pod currently holds it; if you create the new KServe RawDeployment ISVC while ModelMesh is still running, the new predictor pod is very likely to land on a *different* node and hang with:
-
-----
-Multi-Attach error for volume "pvc-...": Volume is already used by pod(s) modelmesh-serving-ovms-mm-...
-----
-
-Release the PVC first by scaling the ModelMesh ServingRuntime to zero. The ISVC stays — you'll delete it cleanly in Exercise 2.6 — but its pod is gone, so the volume detaches and the new KServe pod can mount it on whatever node it's scheduled to.
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n ml-project-c patch servingruntime ovms-mm --type=merge -p '{"spec":{"replicas":0}}'
-----
-
-Wait for the ModelMesh pod to terminate so the PVC actually detaches:
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n ml-project-c wait --for=delete pod -l name=modelmesh-serving-ovms-mm --timeout=120s
-----
-
-[NOTE]
-====
-On a `ReadWriteMany` (RWX) storage class -EFS, CephFS, NFS -multiple nodes can attach the same volume at once and this scale-down is not strictly required. The lab uses RWO because it's the default on AWS gp3, so this step is what makes the migration work on the lab's storage class.
-====
-
-Now create a *single-model* OVMS ServingRuntime and a RawDeployment ISVC that reads the same ONNX model from the same PVC. Apply both:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc apply -f - <<'EOF'
-apiVersion: serving.kserve.io/v1alpha1
-kind: ServingRuntime
-metadata:
-  name: ovms-raw
-  namespace: ml-project-c
-  labels:
-    opendatahub.io/dashboard: "true"
-  annotations:
-    openshift.io/display-name: "OVMS single-model (KServe)"
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rhai-cli-backup, namespace: rhai-migration }
 spec:
-  multiModel: false
-  supportedModelFormats:
-    - name: onnx
-      version: "1"
-      autoSelect: true
-  protocolVersions:
-    - v2
-    - grpc-v2
-  containers:
-    - name: kserve-container
-      image: openvino/model_server:latest
-      args:
-        - --model_name={{.Name}}
-        - --model_path=/mnt/models
-        - --port=8001
-        - --rest_port=8888
-        - --file_system_poll_wait_seconds=0
-        - --target_device=CPU
-      ports:
-        - containerPort: 8888
-          protocol: TCP
-      resources:
-        requests:
-          cpu: "500m"
-          memory: 1Gi
-        limits:
-          cpu: "2"
-          memory: 2Gi
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 5Gi } }
 ---
-apiVersion: serving.kserve.io/v1beta1
-kind: InferenceService
-metadata:
-  name: mobilenet-onnx
-  namespace: ml-project-c
-  annotations:
-    serving.kserve.io/deploymentMode: "RawDeployment"
-    openshift.io/display-name: mobilenet-onnx
-  labels:
-    opendatahub.io/dashboard: "true"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: rhai-cli, namespace: rhai-migration }
 spec:
-  predictor:
-    minReplicas: 1
-    model:
-      modelFormat:
-        name: onnx
-        version: "1"
-      runtime: ovms-raw
-      storageUri: pvc://model-store/mobilenet
-      resources:
-        requests:
-          cpu: "500m"
-          memory: 1Gi
-        limits:
-          cpu: "2"
-          memory: 2Gi
+  serviceName: rhai-cli
+  replicas: 1
+  selector: { matchLabels: { app: rhai-cli } }
+  template:
+    metadata: { labels: { app: rhai-cli } }
+    spec:
+      containers:
+        - name: rhai-cli
+          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.3
+          command: ["sh","-c","sleep infinity"]
+          volumeMounts:
+            - { name: backup, mountPath: /tmp/rhoai-upgrade-backup }
+      volumes:
+        - name: backup
+          persistentVolumeClaim: { claimName: rhai-cli-backup }
 EOF
 ----
 
-Wait for the new RawDeployment ISVC to come up (the storage-initializer copies the model from the PVC, then OVMS loads it):
+Grant the tool's service account the cluster-wide read access it needs:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc mobilenet-onnx -n ml-project-c \
-  -o custom-columns='NAME:.metadata.name,MODE:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+oc create clusterrolebinding rhai-cli-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=rhai-migration:default
 ----
-
-Re-run until `READY` is `True`.
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc mobilenet-onnx -n ml-project-c -o jsonpath='mode={.status.deploymentMode} ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+oc -n rhai-migration get pod rhai-cli-0
 ----
 
 [.console-output]
 ----
-mode=RawDeployment ready=True
+NAME         READY   STATUS    RESTARTS   AGE
+rhai-cli-0   1/1     Running   0          30s
 ----
 
-✓ The migrated `mobilenet-onnx` ISVC is serving on RawDeployment
+✓ Pod status is `Running` and READY shows `1/1`
 
-== Exercise 2.6: Remove the ModelMesh ISVC and runtime
+== Exercise 2.3: Run the assessment
 
-With the model now re-hosted on RawDeployment -and the ModelMesh runtime already scaled to zero in Exercise 2.5 -remove the old ModelMesh ISVC and its multi-model runtime (the runtime only after no ISVC references it):
+Run the lint against the {target-version} target:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc delete isvc my-modelmesh-isvc -n ml-project-c
-oc delete servingruntime ovms-mm -n ml-project-c
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3
 ----
+
+The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | IMPACT | MESSAGE`. On this cluster you'll see both component removals *and* impacted workloads:
+
+[.console-output]
+----
+STATUS  KIND                    GROUP       CHECK                         IMPACT    MESSAGE
+✓       cert-manager            dependency  installed                     info      cert-manager Operator for Red Hat OpenShift installed: cert-manager-operator.v1.19.0
+✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.20.23 meets RHOAI 3.3 minimum version requirement (4.19.9+)
+✓       servicemesh-v3          dependency  installed                     info      Red Hat Service Mesh v3 (servicemeshoperator3.v3.1.0) is available in the 'stable' channel
+✓       dsc                     platform    readiness                     info      DataScienceCluster is ready
+✓       dsci                    platform    readiness                     info      DSCInitialization is ready
+⚠       datasciencepipelines    component   renaming                      warning   DataSciencePipelines component will be renamed to AIPipelines in DSC v2 (RHOAI 3.3)
+✗       kserve                  component   authorino-tls-readiness       critical  Authorino resource not found. Authorino with TLS must be installed for llm-d
+✗       kserve                  component   kuadrant-readiness            critical  Kuadrant resource not found. Kuadrant must be installed for llm-d
+✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.3
+✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.3
+⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.16) is installed but no longer required
+✗       kueue                   component   management-state              critical  Kueue managementState is Managed but the 3.3 upgrade only supports Removed. No workloads use Kueue.
+✗       modelmeshserving        component   removal                       critical  ModelMesh Serving is enabled (state: Managed) but will be removed in RHOAI 3.3
+✗       ray                     component   removal                       critical  CodeFlare is enabled (state: Managed) but will be removed in RHOAI 3.3
+⚠       trainingoperator        component   deprecation                   warning   TrainingOperator (KFTO v1) is deprecated; will be replaced by Trainer v2 in a future release
+⚠       guardrails              workload    config-migration              warning   Found 1 GuardrailsOrchestrator(s) using deprecated otelExporter fields - migrate before upgrade
+⚠       guardrails              workload    impacted-workloads            warning   Found 1 misconfigured GuardrailsOrchestrator(s)
+✗       kserve                  workload    impacted-workloads            critical  Found 2 Serverless InferenceService(s) - will be impacted in RHOAI 3.3
+✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh InferenceService(s) - will be impacted in RHOAI 3.3
+✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh ServingRuntime(s) - will be impacted in RHOAI 3.3
+⚠       kserve                  workload    impacted-workloads            warning   inferenceservice-config ConfigMap must have opendatahub.io/managed=false and include hardware-profile annotations
+✗       llamastackdistribution  workload    config                        critical  Found 1 LlamaStackDistribution(s) that must be deleted and recreated. ALL DATA WILL BE LOST.
+⚠       notebook                workload    impacted-workloads            warning   Found 4 Notebook(s) using 3 unique images: 2 compatible, 1 custom (verification), 1 incompatible (update)
+⚠       notebook                workload    workload-state                warning   Found 4 non-stopped Notebook(s) - all 4 should be stopped before upgrade
+⚠       ray                     workload    impacted-workloads            warning   Found 2 CodeFlare-managed RayCluster(s) which have not had pre-upgrade steps completed
+⚠       trainingoperator        workload    impacted-workloads            warning   Found 1 active PyTorchJob(s) - uses deprecated TrainingOperator (KFTO v1)
+
+Environment:
+  OpenShift AI version: 2.25.6 -> 3.3.3
+  OpenShift version:    4.20.23
+
+Summary:
+  Total: 42 | Passed: 21 | Warnings: 10 | Failed: 11 | Prohibited: 0
+
+Result:
+  FAIL - blocking findings detected
+----
+
+The full report has 42 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
+
+Save the full report for the record:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 --output yaml > rhai-cli-output.yaml
+----
+
+=== Reading the results
+
+The `IMPACT` column is what matters. rhai-cli emits four levels (`prohibited`, `critical`, `warning`, `info`); on this cluster the report has `critical`, `warning`, and `info`:
+
+* *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in three shapes:
+** *Components 3.x removes* -*KServe Serverless*, *Service Mesh v2*, *ModelMesh Serving*, *CodeFlare*, *Kueue*. You disable each in Module 4 after you've migrated its workloads in Module 3.
+** *3.x prerequisites that aren't installed yet* -*Red Hat Connectivity Link* (Authorino with TLS + Kuadrant for llm-d). You install this in Module 4.
+** *Workload findings* you must act on -*Serverless* / *ModelMesh* InferenceServices, the *ModelMesh ServingRuntime*, and the *LlamaStackDistribution*. You convert / delete these in Module 3 (model serving) and Module 4 (LSD).
+* *`warning`* (`⚠`) - things the migration handles automatically *or* that need action but won't block the upgrade by themselves. Examples here: the `datasciencepipelines` → `aipipelines` schema-rename warning (forward-looking — flagged here by the lint but not actually shipped yet in {target-version}; see Module 7 Exercise 7.4), the `inferenceservice-config` ConfigMap patch (you'll run a helper in Module 4), the 4 running workbenches that must be stopped before the upgrade (Module 5), the 2 RayClusters needing pre-upgrade backup (Module 4), the GuardrailsOrchestrator otelExporter migration (Module 7).
+* *`info`* (`✓`) - the check passed; nothing to do.
+
+[IMPORTANT]
+====
+Note the dependency: the `serverless-removal` and `modelmeshserving/removal` *component* criticals can only be cleared safely *after* you migrate the *workload* criticals (Serverless + ModelMesh InferenceServices and the ModelMesh ServingRuntime). Order matters -that's Module 3.
+====
 
 === Verify
 
-No multi-model ServingRuntime and no ModelMesh ISVC should remain anywhere:
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -iE 'critical|warning'
+----
+
+✓ You can see the eleven critical (`✗`) findings and the ten warning (`⚠`) findings
+
+== Exercise 2.4: The assessment is not a workload inventory
+
+A clean or short assessment does not mean an empty cluster. The lint reports *removed components* and *incompatible* workloads -it does not list workloads that are already compatible. A RawDeployment model, for example, won't appear at all. Always inventory what's actually running before you plan the window.
+
+Inventory the model-serving workloads directly, and note their deployment modes:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+----
+
+[.console-output]
+----
+NS               NAME                 MODE            READY
+ml-project-a     my-serverless-isvc   Serverless      True
+ml-project-b     another-sl-model     Serverless      True
+ml-project-c     my-modelmesh-isvc    ModelMesh       True
+ml-project-raw   tinyllama-1b-cpu     RawDeployment   True
+----
+
+Four real, running models -and only the first three need to move before the upgrade.
+
+* `ml-project-a/my-serverless-isvc` and `ml-project-b/another-sl-model` are LLMs (tinyllama on vLLM) running on KServe *Serverless* mode -convert each to RawDeployment in Module 3.
+* `ml-project-c/my-modelmesh-isvc` is a MobileNetV2 image classifier (ONNX) served on *ModelMesh* through OpenVINO Model Server -re-host on a single-model KServe RawDeployment runtime in Module 3.
+* `ml-project-raw/tinyllama-1b-cpu` is already on KServe *RawDeployment* -3.x-compatible as-is, nothing to do.
+
+This is also the lesson the lint already taught: it flagged the first three as impacted workloads and said nothing about `tinyllama-1b-cpu`, because RawDeployment is the supported 3.x mode. A clean lint for an ISVC means "nothing to convert here," not "no ISVC exists here."
+
+Inventory the multi-model ServingRuntimes (the ModelMesh signal is `spec.multiModel: true`):
 
 [.console-input]
 [source,role="execute"]
 ----
 oc get servingruntime -A -o json | jq -r '.items[] | select(.spec.multiModel==true) | "\(.metadata.namespace)/\(.metadata.name)"'
-oc get isvc -A -o json | jq -r '.items[] | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") == "ModelMesh" or (.status.deploymentMode // "") == "ModelMesh") | "\(.metadata.namespace)/\(.metadata.name)"'
-echo "--- both queries above should be empty ---"
 ----
 
 [.console-output]
 ----
---- both queries above should be empty ---
+ml-project-c/ovms-mm
 ----
 
-✓ No multi-model ServingRuntimes and no ModelMesh ISVCs remain -the model now serves only on RawDeployment
-
-== Exercise 2.7: Confirm every model is RawDeployment
-
-Before you move on, confirm the cluster's entire serving surface is RawDeployment and healthy. You should see all four models -the two converted LLMs, the re-hosted ONNX classifier, and the already-RawDeployment ISVC that needed no work:
+LLMInferenceService (llm-d) and LlamaStackDistribution are *separate CRDs* from `InferenceService` -they don't appear in the `oc get isvc` table above and they're the workloads driving the `authorino-tls-readiness`, `kuadrant-readiness`, and `llamastackdistribution / config` blockers from Exercise 2.3:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,STATUS:.status.deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
+oc get llminferenceservice -A
+oc get llamastackdistribution -A
 ----
 
 [.console-output]
 ----
-NS               NAME                 MODE            STATUS          READY
-ml-project-a     my-serverless-isvc   RawDeployment   RawDeployment   True
-ml-project-b     another-sl-model     RawDeployment   RawDeployment   True
-ml-project-c     mobilenet-onnx       RawDeployment   RawDeployment   True
-ml-project-raw   tinyllama-1b-cpu     RawDeployment   RawDeployment   True
+NAMESPACE       NAME           URL   READY   REASON                       AGE
+llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
+
+NAMESPACE             NAME                    PHASE          OPERATOR VERSION
+ldap-user17-rag-225   lsd-llama-milvus-2323   Initializing   "0.3.0"
 ----
+
+* `llm-project-a/my-llm-model` is an LLMInferenceService (the 3.x distributed-inference CRD). 3.x routes its traffic through Gateway API with Kuadrant + Authorino -*neither of which is installed yet*. You'll install Red Hat Connectivity Link in Module 4 and pin its template annotations so the 3.x upgrade doesn't rewrite them under a running scheduler.
+* `ldap-user17-rag-225/lsd-llama-milvus-2323` is a Llama Stack Distribution. 3.x moves Llama Stack from SQLite to PostgreSQL with no in-place data migration path. You'll delete this LSD in Module 4 (data archival is out of scope here) and deploy a fresh 3.x-shaped LSD in Module 7.
+
+The other 3.x-affected components on this cluster (each lives in its own namespace and follows its own migration path -don't assume the model-serving inventory above is exhaustive):
+
+[.console-input]
+[source,role="execute"]
+----
+echo "--- Feature Store ---";   oc get featurestore -A 2>/dev/null
+echo "--- KFTO PyTorchJobs ---";oc get pytorchjob -A 2>/dev/null
+echo "--- Model Registry ---";  oc get modelregistries.modelregistry.opendatahub.io -A 2>/dev/null
+echo "--- AI Pipelines (DSPAs) ---"; oc get dspa -A 2>/dev/null
+echo "--- Ray clusters ---";    oc get raycluster -A 2>/dev/null
+echo "--- TrustyAI services ---"; oc get trustyaiservice -A 2>/dev/null
+----
+
+[.console-output]
+----
+--- Feature Store ---
+NAMESPACE       NAME              STATUS   AGE
+project-alpha   my-featurestore   Ready    2h
+
+--- KFTO PyTorchJobs ---
+NAMESPACE          NAME                           STATE     AGE
+pytorch-training   pytorch-distributed-training   Running   2h
+
+--- Model Registry ---
+NAMESPACE                NAME                AVAILABLE   AGE
+rhoai-model-registries   my-model-registry   True        2h
+
+--- AI Pipelines (DSPAs) ---
+NAMESPACE     NAME               AGE
+dspa-sample   sample-pipelines   2h
+
+--- Ray clusters ---
+NAMESPACE   NAME                  DESIRED   AVAILABLE   STATUS   AGE
+raytest     comprehensive-mixed   2         2           ready    2h
+raytest     sdk-configurations    1         1           ready    2h
+
+--- TrustyAI services ---
+NAMESPACE                 NAME               AGE
+test-trustyaiservice-db   trustyai-service   2h
+test-trustyaiservice      trustyai-service   2h
+----
+
+Each of these has a 2→3 migration concern even though most don't show up as rhai-cli blockers:
+
+* *Feast (`project-alpha/my-featurestore`)* -Tech Preview in 2.25, GA in 3.3. No pre-upgrade action; verify post-upgrade.
+* *KFTO (`pytorch-training/pytorch-distributed-training`)* -PyTorchJobs run across the upgrade. No action; verify they survived.
+* *Model Registry* -dashboard nav moves (`Models → Model registry` becomes `AI hub → Registry`) and a new `model-catalog-postgres` pod appears. Verify post-upgrade and tell users about the nav change.
+* *AI Pipelines DSPA* -pre-upgrade DSPA health snapshot in Module 4; post-upgrade DSPA verification in Module 7. (Architectural notes also describe a future DSC `datasciencepipelines` → `aipipelines` rename; that rename hasn't shipped in {target-version}.)
+* *RayClusters* -CodeFlare is removed in 3.x; KubeRay takes over. Back up CR YAMLs before disabling Ray; run the migration script post-upgrade.
+* *TrustyAI* -storage schema changed. Back up metrics + data before the upgrade; check for data loss and restore post-upgrade.
+
+Inventory the workbenches and custom images:
+
+[.console-input]
+[source,role="execute"]
+----
+echo "Notebooks:"; oc get notebooks -A --no-headers 2>/dev/null | wc -l
+echo "BYON ImageStreams:"; oc get imagestream -n redhat-ods-applications -l app.kubernetes.io/created-by=byon --no-headers 2>/dev/null | wc -l
+----
+
+[.console-output]
+----
+Notebooks:
+       4
+BYON ImageStreams:
+       1
+----
+
+Four workbenches and one custom (BYON) workbench image -every migration concern in one cluster: Serverless models, a ModelMesh model, an LLMInferenceService (llm-d), a LlamaStackDistribution, a custom workbench image, and workbenches that have to be stopped before the upgrade.
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."serving.kserve.io/deploymentMode" // "") != "RawDeployment")] | length'
+oc get isvc -A --no-headers | awk '{print $1"/"$2}'
 ----
 
 [.console-output]
 ----
-0
+ml-project-a/my-serverless-isvc
+ml-project-b/another-sl-model
+ml-project-c/my-modelmesh-isvc
+ml-project-raw/tinyllama-1b-cpu
 ----
 
-✓ Zero non-RawDeployment ISVCs remain -all four models are on RawDeployment and the serving surface is safe to disable Serverless and ModelMesh
-
-== Troubleshooting
-
-*Issue*: `oc apply` of the recreated ISVC fails with a `deploymentMode` webhook error.
-
-*Solution*: Confirm you edited the *backup file* annotation to `RawDeployment` (Exercise 2.2 step 2) and that you deleted the old ISVC before re-applying. The webhook only blocks *changing* mode on an existing object; a fresh create with `RawDeployment` is accepted.
-
-*Issue*: The recreated ISVC sits `READY=False` for several minutes.
-
-*Solution*: RawDeployment pulls and loads the model fresh. Watch the predictor pod: `oc get pods -n <ns> -l serving.kserve.io/inferenceservice=<name>`. A CPU model can take a few minutes. Check pod logs if it never becomes ready.
-
-*Issue*: You can't delete the multi-model ServingRuntime -"still in use".
-
-*Solution*: Delete the ModelMesh ISVC first (Exercise 2.5). The runtime can only be removed once no ISVC references it.
+✓ You can see four InferenceServices: two Serverless (`ml-project-a`, `ml-project-b`), one ModelMesh (`ml-project-c`), and one already-RawDeployment (`ml-project-raw`). The first three must migrate before the upgrade; the RawDeployment one is already compatible.
 
 == Learning outcomes
 
-You've completed the conversion phase. You can:
+You've completed the assessment phase. You can:
 
-* [x] Enumerate InferenceServices by deployment mode
-* [x] Convert Serverless ISVCs to RawDeployment with backup-and-recreate
-* [x] Migrate a ModelMesh model off multi-model serving
-* [x] Confirm the entire serving surface is RawDeployment and Ready
+* [x] Deploy and run the `rhai-cli` assessment tool
+* [x] Distinguish critical findings (`✗`) from warnings (`⚠`)
+* [x] Inventory model-serving and workbench workloads directly
+* [x] Explain why a clean lint is not a workload inventory
 
 == Module summary
 
-Every model now runs on KServe RawDeployment -the only serving mode 3.x supports. Because no workload depends on Serverless or ModelMesh anymore, it's finally safe to disable those components. In the next module you'll do the platform remediation: flip the removed components to `Removed`, patch the model-serving ConfigMap, tear down the Service Mesh dependency, and uninstall the 2.x operators.
+The cluster has eleven critical findings (component removals + 3.x prerequisites + workload conversions), ten warnings, and live workloads behind nearly every blocker. You cannot clear the Serverless and ModelMesh component criticals until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 4 then runs the rest of the platform prep -backups, ConfigMap update, RHCL install, LSD delete, and the operator uninstalls.
 
-Continue to *Module 3: Remediate the platform*.
+Continue to *Module 3: Convert the model-serving workloads*.

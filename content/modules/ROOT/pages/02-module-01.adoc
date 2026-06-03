@@ -1,345 +1,123 @@
-= Module 1: Assess the cluster
+= Module 1: Test the baseline workloads
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-Before you change anything, you need to know what the upgrade will break. Red Hat ships an assessment tool, `rhai-cli`, that inspects the cluster against a target version and reports every component, workload, and dependency that needs attention.
-
-In this module you'll deploy the assessment tool, run it against your {source-version} cluster targeting {target-version}, learn to read the results, and -critically -learn why a clean assessment is *not* the same as an empty cluster.
+Before you change anything, capture what *works* today. A migration without a baseline is just hope: you have no way to tell whether something failed because of the upgrade or because it was already broken. In this module you'll exercise the user-facing workloads -models, workbenches, pipelines, Ray clusters -and confirm each one responds. Module 8 runs the *same* tests post-upgrade so you can compare side by side.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Deploy and run the `rhai-cli` assessment tool against a live cluster
-* Read a `rhai-cli lint` report and identify blocking versus advisory findings
-* Inventory the model-serving and workbench workloads directly
-* Explain why the assessment is not a substitute for a workload inventory
+* List the user-facing workloads on the cluster (ISVCs, workbenches, DSPAs, Ray clusters)
+* Send an inference request to each ISVC and get a sensible response
+* Confirm each workbench is reachable through its 2.x Route
+* Confirm the DSPA serves the pipelines API and Ray clusters are `ready`
 
-== Exercise 1.1: Confirm the starting state
-
-Confirm the cluster is on OpenShift AI {source-version} and the platform is healthy.
+== Exercise 1.1: Inventory the workloads
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get csv -n redhat-ods-operator -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' | grep rhods-operator
-oc get dsc default-dsc -o jsonpath='DSC phase: {.status.phase}{"\n"}'
-oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
+echo "--- ISVCs ---"
+oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,URL:.status.url,READY:.status.conditions[?(@.type=="Ready")].status'
+
+echo ""
+echo "--- Workbenches ---"
+oc get notebook -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name'
+
+echo ""
+echo "--- DSPAs ---"
+oc get dspa -A
+
+echo ""
+echo "--- Ray clusters ---"
+oc get raycluster -A
 ----
 
-[.console-output]
-----
-rhods-operator.2.25.6   Succeeded
-DSC phase: Ready
-DSCI phase: Ready
-----
+Expect 4 ISVCs (2 Serverless, 1 ModelMesh, 1 RawDeployment), 4 workbenches, 1 DSPA, 2 Ray clusters. If anything is missing now, document it before the migration -don't let it look like the upgrade caused the loss.
 
-=== Verify
+== Exercise 1.2: Inference test each model
+
+The same probing logic Module 8 uses post-upgrade: discover the served model ID via `/v1/models` (vLLM) or `/v2/models/<name>` (OVMS), then send a representative request. ISVCs with only an `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get dsc default-dsc -o jsonpath='{.status.phase}{"\n"}'
+for isvc in $(oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  NS="${isvc%/*}"; NAME="${isvc##*/}"
+  URL=$(oc get isvc "$NAME" -n "$NS" -o jsonpath='{.status.url}')
+  POD_STATE=$(oc get pods -n "$NS" -l serving.kserve.io/inferenceservice="$NAME" \
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+  echo "--- $isvc ---"
+  echo "  URL:           $URL"
+  echo "  Predictor pod: ${POD_STATE:-no pod}"
+  [[ "$URL" != https://* ]] && { echo "  HTTP test:     skipped (cluster-internal only)"; continue; }
+  MODEL_ID=$(curl -sk --max-time 10 "${URL}/v1/models" 2>/dev/null | jq -r '.data[0].id // empty')
+  if [ -n "$MODEL_ID" ]; then
+    REPLY=$(curl -sk --max-time 30 "${URL}/v1/completions" \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"The capital of France is\",\"max_tokens\":8,\"temperature\":0}" \
+      | jq -r '.choices[0].text // "(error)"')
+    echo "  vLLM model id: $MODEL_ID"
+    echo "  Completion:    $REPLY"
+  else
+    META=$(curl -sk --max-time 10 "${URL}/v2/models/mobilenet" | jq -r '.name // empty')
+    echo "  OVMS model:    ${META:-(no metadata)}"
+  fi
+done
 ----
 
-✓ Output is `Ready` -the cluster is healthy and ready to assess
+Expect every predictor pod `Running` and the externally-reachable LLMs to return sensible completions.
 
-== Exercise 1.2: Deploy the assessment tool
+== Exercise 1.3: Confirm workbenches respond
 
-`rhai-cli` runs from a pod inside the cluster so it can read the OLM CSVs, the DSC/DSCI, and workload custom resources cluster-wide. Create a project and deploy it.
+2.x workbenches are exposed through OpenShift Routes. Curl each one — a 200, 302, or 303 confirms the pod + Route are healthy:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc new-project rhai-migration
+for nb in $(oc get notebook -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  NS="${nb%/*}"; NAME="${nb##*/}"
+  HOST=$(oc get route "$NAME" -n "$NS" -o jsonpath='{.spec.host}' 2>/dev/null)
+  if [ -z "$HOST" ]; then
+    echo "$nb: no Route (workbench may be stopped)"
+    continue
+  fi
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://${HOST}/")
+  echo "$nb https://${HOST}/ -> HTTP $CODE"
+done
 ----
+
+== Exercise 1.4: Confirm the DSPA and Ray clusters respond
 
 [.console-input]
 [source,role="execute"]
 ----
-oc apply -f - <<'EOF'
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: { name: rhai-cli-backup, namespace: rhai-migration }
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources: { requests: { storage: 5Gi } }
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata: { name: rhai-cli, namespace: rhai-migration }
-spec:
-  serviceName: rhai-cli
-  replicas: 1
-  selector: { matchLabels: { app: rhai-cli } }
-  template:
-    metadata: { labels: { app: rhai-cli } }
-    spec:
-      containers:
-        - name: rhai-cli
-          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.3
-          command: ["sh","-c","sleep infinity"]
-          volumeMounts:
-            - { name: backup, mountPath: /tmp/rhoai-upgrade-backup }
-      volumes:
-        - name: backup
-          persistentVolumeClaim: { claimName: rhai-cli-backup }
-EOF
+# DSPA: healthz + pipelines list
+NS=dspa-sample
+TOKEN=$(oc whoami -t)
+DSPA_HOST=$(oc get route -n "$NS" ds-pipeline-sample-pipelines -o jsonpath='{.spec.host}' 2>/dev/null)
+echo "--- DSPA https://${DSPA_HOST} ---"
+curl -sk -H "Authorization: Bearer $TOKEN" "https://${DSPA_HOST}/apis/v2beta1/healthz" | jq .
+
+# Ray: cluster state
+echo ""
+echo "--- Ray clusters ---"
+oc get raycluster -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.spec.workerGroupSpecs[0].replicas,AVAILABLE:.status.availableWorkerReplicas,STATUS:.status.state'
 ----
 
-Grant the tool's service account the cluster-wide read access it needs:
-
-[.console-input]
-[source,role="execute"]
-----
-oc create clusterrolebinding rhai-cli-admin \
-  --clusterrole=cluster-admin \
-  --serviceaccount=rhai-migration:default
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n rhai-migration get pod rhai-cli-0
-----
-
-[.console-output]
-----
-NAME         READY   STATUS    RESTARTS   AGE
-rhai-cli-0   1/1     Running   0          30s
-----
-
-✓ Pod status is `Running` and READY shows `1/1`
-
-== Exercise 1.3: Run the assessment
-
-Run the lint against the {target-version} target:
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3
-----
-
-The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | IMPACT | MESSAGE`. On this cluster you'll see both component removals *and* impacted workloads:
-
-[.console-output]
-----
-STATUS  KIND                    CHECK                    IMPACT    MESSAGE
-✗       kserve                  serverless-removal       blocking  KServe serverless mode is enabled but will be removed in RHOAI 3.3
-✗       kserve                  servicemesh-removal      blocking  ServiceMesh is enabled but is no longer required by RHOAI 3.3
-✗       kserve                  authorino-tls-readiness  critical  Authorino resource not found. Authorino with TLS must be installed for llm-d
-✗       kserve                  kuadrant-readiness       critical  Kuadrant resource not found. Kuadrant must be installed for llm-d
-✗       modelmeshserving        removal                  blocking  ModelMesh Serving is enabled but will be removed in RHOAI 3.3
-✗       ray                     removal                  blocking  CodeFlare is enabled but will be removed in RHOAI 3.3
-✗       llamastackdistribution  config                   critical  Found 1 LlamaStackDistribution(s) that must be deleted and recreated after RHOAI 3.3 upgrade
-⚠       kserve                  impacted-workloads       advisory  Serverless InferenceService(s) found that must be converted to RawDeployment
-⚠       kserve                  impacted-workloads       advisory  ModelMesh InferenceService(s) found that must be migrated
-⚠       notebook                impacted-workloads       advisory  Notebook(s) found using images that may not work in RHOAI 3.x
-⚠       dashboard               hardwareprofile-...      advisory  Found legacy HardwareProfile(s) that will be auto-migrated
-⚠       kserve                  impacted-workloads       advisory  inferenceservice-config ConfigMap must have opendatahub.io/managed=false
-----
-
-Save the full report for the record:
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 --output yaml > rhai-cli-output.yaml
-----
-
-=== Reading the results
-
-The `IMPACT` column is what matters:
-
-* *`blocking`* (`✗`) / *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in two shapes:
-** *Components 3.x removes* -*KServe Serverless*, *Service Mesh v2*, *ModelMesh Serving*, *CodeFlare* -flagged with `IMPACT=blocking`. You disable each in Module 3 after you've migrated its workloads in Module 2.
-** *3.x prerequisites that aren't installed yet* -*Red Hat Connectivity Link* (Authorino with TLS + Kuadrant for llm-d) and the *LlamaStackDistribution data archive* -flagged with `IMPACT=critical`. You install / archive these in Module 3.
-* *`advisory`* (`⚠`) - the migration handles some automatically (HardwareProfile migration), but others are *workload* findings you must act on before you can clear the blockers. The Serverless and ModelMesh "impacted-workloads" advisories are exactly that: you must convert those models before you can safely disable Serverless and ModelMesh.
-
-[IMPORTANT]
-====
-Note the dependency: the `serverless-removal` and `modelmeshserving/removal` *blockers* can only be cleared safely *after* you migrate the workloads called out in the *advisory* impacted-workloads findings. Order matters -that's Module 2.
-====
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -iE 'blocking|critical|impacted'
-----
-
-✓ You can see the seven blocking/critical findings and the impacted-workloads advisories
-
-== Exercise 1.4: The assessment is not a workload inventory
-
-A clean or short assessment does not mean an empty cluster. The lint reports *removed components* and *incompatible* workloads -it does not list workloads that are already compatible. A RawDeployment model, for example, won't appear at all. Always inventory what's actually running before you plan the window.
-
-Inventory the model-serving workloads directly, and note their deployment modes:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get isvc -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,MODE:.metadata.annotations.serving\.kserve\.io/deploymentMode,READY:.status.conditions[?(@.type=="Ready")].status'
-----
-
-[.console-output]
-----
-NS               NAME                 MODE            READY
-ml-project-a     my-serverless-isvc   Serverless      True
-ml-project-b     another-sl-model     Serverless      True
-ml-project-c     my-modelmesh-isvc    ModelMesh       True
-ml-project-raw   tinyllama-1b-cpu     RawDeployment   True
-----
-
-Four real, running models -and only the first three need to move before the upgrade.
-
-* `ml-project-a/my-serverless-isvc` and `ml-project-b/another-sl-model` are LLMs (tinyllama on vLLM) running on KServe *Serverless* mode -convert each to RawDeployment in Module 2.
-* `ml-project-c/my-modelmesh-isvc` is a MobileNetV2 image classifier (ONNX) served on *ModelMesh* through OpenVINO Model Server -re-host on a single-model KServe RawDeployment runtime in Module 2.
-* `ml-project-raw/tinyllama-1b-cpu` is already on KServe *RawDeployment* -3.x-compatible as-is, nothing to do.
-
-This is also the lesson the lint already taught: it flagged the first three as impacted workloads and said nothing about `tinyllama-1b-cpu`, because RawDeployment is the supported 3.x mode. A clean lint for an ISVC means "nothing to convert here," not "no ISVC exists here."
-
-Inventory the multi-model ServingRuntimes (the ModelMesh signal is `spec.multiModel: true`):
-
-[.console-input]
-[source,role="execute"]
-----
-oc get servingruntime -A -o json | jq -r '.items[] | select(.spec.multiModel==true) | "\(.metadata.namespace)/\(.metadata.name)"'
-----
-
-[.console-output]
-----
-ml-project-c/ovms-mm
-----
-
-LLMInferenceService (llm-d) and LlamaStackDistribution are *separate CRDs* from `InferenceService` -they don't appear in the `oc get isvc` table above and they're the workloads driving the `authorino-tls-readiness`, `kuadrant-readiness`, and `llamastackdistribution / config` blockers from Exercise 1.3:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get llminferenceservice -A
-oc get llamastackdistribution -A
-----
-
-[.console-output]
-----
-NAMESPACE       NAME           URL   READY   REASON                       AGE
-llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
-
-NAMESPACE             NAME                    PHASE          OPERATOR VERSION
-ldap-user17-rag-225   lsd-llama-milvus-2323   Initializing   "0.3.0"
-----
-
-* `llm-project-a/my-llm-model` is an LLMInferenceService (the 3.x distributed-inference CRD). 3.x routes its traffic through Gateway API with Kuadrant + Authorino -*neither of which is installed yet*. You'll install Red Hat Connectivity Link in Module 3 and pin its template annotations so the 3.x upgrade doesn't rewrite them under a running scheduler.
-* `ldap-user17-rag-225/lsd-llama-milvus-2323` is a Llama Stack Distribution. 3.x moves Llama Stack from SQLite to PostgreSQL with no in-place data migration path. You'll delete this LSD in Module 3 (data archival is out of scope here) and deploy a fresh 3.x-shaped LSD in Module 6.
-
-The other 3.x-affected components on this cluster (each lives in its own namespace and follows its own migration path -don't assume the model-serving inventory above is exhaustive):
-
-[.console-input]
-[source,role="execute"]
-----
-echo "--- Feature Store ---";   oc get featurestore -A 2>/dev/null
-echo "--- KFTO PyTorchJobs ---";oc get pytorchjob -A 2>/dev/null
-echo "--- Model Registry ---";  oc get modelregistries.modelregistry.opendatahub.io -A 2>/dev/null
-echo "--- AI Pipelines (DSPAs) ---"; oc get dspa -A 2>/dev/null
-echo "--- Ray clusters ---";    oc get raycluster -A 2>/dev/null
-echo "--- TrustyAI services ---"; oc get trustyaiservice -A 2>/dev/null
-----
-
-[.console-output]
-----
---- Feature Store ---
-NAMESPACE       NAME              STATUS   AGE
-project-alpha   my-featurestore   Ready    2h
-
---- KFTO PyTorchJobs ---
-NAMESPACE          NAME                           STATE     AGE
-pytorch-training   pytorch-distributed-training   Running   2h
-
---- Model Registry ---
-NAMESPACE                NAME                AVAILABLE   AGE
-rhoai-model-registries   my-model-registry   True        2h
-
---- AI Pipelines (DSPAs) ---
-NAMESPACE     NAME               AGE
-dspa-sample   sample-pipelines   2h
-
---- Ray clusters ---
-NAMESPACE   NAME                  DESIRED   AVAILABLE   STATUS   AGE
-raytest     comprehensive-mixed   2         2           ready    2h
-raytest     sdk-configurations    1         1           ready    2h
-
---- TrustyAI services ---
-NAMESPACE                 NAME               AGE
-test-trustyaiservice-db   trustyai-service   2h
-test-trustyaiservice      trustyai-service   2h
-----
-
-Each of these has a 2→3 migration concern even though most don't show up as rhai-cli blockers:
-
-* *Feast (`project-alpha/my-featurestore`)* -Tech Preview in 2.25, GA in 3.3. No pre-upgrade action; verify post-upgrade.
-* *KFTO (`pytorch-training/pytorch-distributed-training`)* -PyTorchJobs run across the upgrade. No action; verify they survived.
-* *Model Registry* -dashboard nav moves (`Models → Model registry` becomes `AI hub → Registry`) and a new `model-catalog-postgres` pod appears. Verify post-upgrade and tell users about the nav change.
-* *AI Pipelines DSPA* -schema check + `datasciencepipelines` → `aipipelines` rename. Pre-upgrade DSPA check in Module 3, schema rename verified in Module 6.
-* *RayClusters* -CodeFlare is removed in 3.x; KubeRay takes over. Back up CR YAMLs before disabling Ray; run the migration script post-upgrade.
-* *TrustyAI* -storage schema changed. Back up metrics + data before the upgrade; check for data loss and restore post-upgrade.
-
-Inventory the workbenches and custom images:
-
-[.console-input]
-[source,role="execute"]
-----
-echo "Notebooks:"; oc get notebooks -A --no-headers 2>/dev/null | wc -l
-echo "BYON ImageStreams:"; oc get imagestream -n redhat-ods-applications -l app.kubernetes.io/created-by=byon --no-headers 2>/dev/null | wc -l
-----
-
-[.console-output]
-----
-Notebooks:
-       5
-BYON ImageStreams:
-       1
-----
-
-Five workbenches and one custom (BYON) workbench image -every migration concern in one cluster: Serverless models, a ModelMesh model, an LLMInferenceService (llm-d), a LlamaStackDistribution, a custom workbench image, and workbenches that have to be stopped before the upgrade.
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get isvc -A --no-headers | awk '{print $1"/"$2}'
-----
-
-[.console-output]
-----
-ml-project-a/my-serverless-isvc
-ml-project-b/another-sl-model
-ml-project-c/my-modelmesh-isvc
-ml-project-raw/tinyllama-1b-cpu
-----
-
-✓ You can see four InferenceServices: two Serverless (`ml-project-a`, `ml-project-b`), one ModelMesh (`ml-project-c`), and one already-RawDeployment (`ml-project-raw`). The first three must migrate before the upgrade; the RawDeployment one is already compatible.
+Expect DSPA healthz to return a healthy response and both Ray clusters to show `STATUS=ready` with `AVAILABLE` matching `DESIRED`.
 
 == Learning outcomes
 
-You've completed the assessment phase. You can:
+You've confirmed the user-visible workloads work *before* the migration. You can:
 
-* [x] Deploy and run the `rhai-cli` assessment tool
-* [x] Distinguish blocking findings (`✗`) from advisory findings (`⚠`)
-* [x] Inventory model-serving and workbench workloads directly
-* [x] Explain why a clean lint is not a workload inventory
+* [x] Inventory the workloads the migration will touch
+* [x] Exercise each model with a real inference call
+* [x] Confirm each workbench is reachable
+* [x] Confirm the DSPA + Ray clusters are healthy
 
 == Module summary
 
-The cluster has four blocking component removals, three critical 3.x prerequisites (RHCL for llm-d auth + a Llama Stack data archive), *and* live workloads behind each. You cannot clear the Serverless and ModelMesh blockers until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 3 then installs RHCL, archives the LSD, and turns off the 2.x serving stack.
-
-Continue to *Module 2: Convert the model-serving workloads*.
+The cluster's user-visible surface is known-good. If anything looked broken before you touched the cluster, fix it now -or document it as already-broken so the migration doesn't take the blame. Continue to *Module 2: Assess the cluster*.

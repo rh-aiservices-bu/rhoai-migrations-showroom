@@ -1,0 +1,192 @@
+= Module 8: Re-test the migrated workloads
+:source-highlighter: rouge
+:toc: macro
+:toclevels: 2
+
+Module 7 confirmed the platform is healthy. This module confirms the *workloads* still work for users. Four quick tests: hit each model, reach each workbench, list pipelines through the DSPA, confirm Ray clusters accept work.
+
+These are smoke tests -they answer "does this thing serve a request?" Not "does it produce identical bytes to pre-upgrade?" If you want before/after evidence, Module 1 captured a pre-upgrade snapshot you can diff against; this module doesn't require it.
+
+== Learning objectives
+
+By the end of this module, you'll be able to:
+
+* Send an inference request to each migrated ISVC and confirm a sensible response
+* Reach each workbench through its new Gateway URL
+* Confirm the AI Pipelines DSPA serves the pipelines API
+* Confirm every Ray cluster is `ready`
+
+== Exercise 8.1: Inference test each model
+
+Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test.
+
+[.console-input]
+[source,role="execute"]
+----
+for isvc in $(oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  NS="${isvc%/*}"; NAME="${isvc##*/}"
+  URL=$(oc get isvc "$NAME" -n "$NS" -o jsonpath='{.status.url}')
+  POD_STATE=$(oc get pods -n "$NS" -l serving.kserve.io/inferenceservice="$NAME" \
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+
+  echo "--- $isvc ---"
+  echo "  URL:           $URL"
+  echo "  Predictor pod: ${POD_STATE:-no pod}"
+
+  if [[ "$URL" != https://* ]]; then
+    echo "  HTTP test:     skipped (cluster-internal only)"
+    continue
+  fi
+
+  # vLLM ISVCs expose /v1/models; OVMS exposes /v2/models/<name>. Try v1 first.
+  MODEL_ID=$(curl -sk --max-time 10 "${URL}/v1/models" 2>/dev/null | jq -r '.data[0].id // empty')
+  if [ -n "$MODEL_ID" ]; then
+    REPLY=$(curl -sk --max-time 30 "${URL}/v1/completions" \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"The capital of France is\",\"max_tokens\":8,\"temperature\":0}" \
+      | jq -r '.choices[0].text // "(error)"')
+    echo "  vLLM model id: $MODEL_ID"
+    echo "  Completion:    $REPLY"
+  else
+    # Fall back to OVMS v2 model-metadata probe (works for the migrated ONNX classifier)
+    META=$(curl -sk --max-time 10 "${URL}/v2/models/mobilenet" | jq -r '.name // empty')
+    echo "  OVMS model:    ${META:-(no metadata)}"
+  fi
+done
+----
+
+Expect every ISVC to show its predictor pod `Running`. The two externally-reachable LLMs return a vLLM model ID (`tinyllama` on this lab) and a sensible completion. The two cluster-internal ISVCs (`my-modelmesh-isvc`, `tinyllama-1b-cpu`) skip the HTTP probe -they're Headless and serve only in-cluster callers; their pod state is what proves they survived.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length'
+----
+
+[.console-output]
+----
+4
+----
+
+✓ All four ISVCs report `Ready=True` and respond to inference
+
+== Exercise 8.2: Reach each workbench through the Gateway
+
+3.x workbenches sit behind the Gateway API at `https://<gateway-host>/notebook/<ns>/<name>/`. Curl each one (you don't need to log in — a 2xx or 3xx status confirms the route + kube-rbac-proxy are working):
+
+[.console-input]
+[source,role="execute"]
+----
+GATEWAY_HOST=$(oc get gatewayconfig default-gateway -o jsonpath='{.spec.hostname}')
+for nb in $(oc get notebook -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  NS="${nb%/*}"; NAME="${nb##*/}"
+  URL="https://${GATEWAY_HOST}/notebook/${NS}/${NAME}/"
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "$URL")
+  echo "$nb -> HTTP $CODE"
+done
+----
+
+Expect HTTP 200, 302, or 303 from each workbench.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- bash -c '
+  cd /opt/rhai-upgrade-helpers/workbenches && \
+  ./workbench-2.x-to-3.x-upgrade.sh list --all
+' | grep -E "Legacy|Migrated"
+----
+
+✓ `Legacy (2.x): 0` and all workbenches show as migrated
+
+== Exercise 8.3: Confirm the DSPA serves the pipelines API
+
+The DSPA is reconciled by the same `datasciencepipelines` component as pre-upgrade. Hit the API root + list pipelines:
+
+[.console-input]
+[source,role="execute"]
+----
+NS=dspa-sample
+TOKEN=$(oc whoami -t)
+DSPA_HOST=$(oc get route -n "$NS" ds-pipeline-sample-pipelines -o jsonpath='{.spec.host}' 2>/dev/null)
+echo "DSPA endpoint: https://${DSPA_HOST}"
+
+curl -sk -H "Authorization: Bearer $TOKEN" "https://${DSPA_HOST}/apis/v2beta1/healthz" | jq .
+curl -sk -H "Authorization: Bearer $TOKEN" "https://${DSPA_HOST}/apis/v2beta1/pipelines" \
+  | jq '.pipelines[]? | {id: .pipeline_id, name: .display_name}' 2>/dev/null \
+  || echo "(no pipelines imported yet — that's OK)"
+----
+
+Expect `healthz` to return a healthy response. The pipelines list may be empty on a fresh lab; that just means no one has imported a pipeline yet.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dspa -A -o json | jq -r '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length'
+----
+
+✓ The DSPA reports `Ready=True`
+
+== Exercise 8.4: Confirm Ray clusters accept work
+
+Module 7 Exercise 7.4 ran the KubeRay migration script. Confirm each cluster is still `ready` and reports its worker count:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get raycluster -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.spec.workerGroupSpecs[0].replicas,AVAILABLE:.status.availableWorkerReplicas,STATUS:.status.state'
+----
+
+Expect each cluster to show `STATUS=ready` with `AVAILABLE` matching `DESIRED`.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready")] | length'
+----
+
+[.console-output]
+----
+2
+----
+
+✓ Both Ray clusters report `ready`
+
+== Troubleshooting
+
+*Issue*: An LLM inference returns 502 or 503.
+
+*Solution*: Give the predictor pod a minute -the 3.x kserve controller may still be rolling it onto the newer runtime image. Re-run after 60 seconds. If it persists, check the predictor pod logs.
+
+*Issue*: A workbench URL returns 404.
+
+*Solution*: The Gateway HTTPRoute hasn't propagated yet. Wait 2 minutes and re-test. If still 404, confirm the workbench Notebook CR has been patched (Module 7 Exercise 7.3).
+
+*Issue*: The DSPA endpoint returns 404.
+
+*Solution*: The pipeline endpoint path can vary on 3.x installs. Find the actual route with `oc get httproute -A -l app.kubernetes.io/instance=sample-pipelines -o yaml` and adjust.
+
+*Issue*: A Ray cluster isn't `ready`.
+
+*Solution*: Re-run the Module 7 migration helper for that cluster: `oc exec -n rhai-migration rhai-cli-0 -it -- python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py post-upgrade --namespace <ns>`.
+
+== Learning outcomes
+
+You've validated the user-visible workloads on the new platform. You can:
+
+* [x] Send an inference request to each migrated ISVC and confirm a sensible response
+* [x] Reach each workbench through the new Gateway URL
+* [x] Confirm the AI Pipelines DSPA serves the pipelines API
+* [x] Confirm Ray clusters still accept work
+
+== Module summary
+
+Every user-visible workload still works on {target-version}. Continue to the *Conclusion* to review what the workshop accomplished and what production migrations typically need on top of what the lab covered.

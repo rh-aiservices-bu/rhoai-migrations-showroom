@@ -1,200 +1,203 @@
-= Module 5: Perform the upgrade
+= Module 5: Handle the workbench images
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
-The cluster is pre-upgrade-clean: models converted to RawDeployment, removed components disabled, 2.x operators uninstalled, workbenches stopped. Now you'll trigger the migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to {target-version}.
+The last thing to handle before the upgrade is the workbenches. RHOAI 3.x changes the workbench authentication model (oauth-proxy to kube-rbac-proxy) and routing (Routes to Gateway API). Out-of-the-box images are bumped by the operator, but *custom* (BYON) images and out-of-date image tags need attention -and you have both on this cluster.
 
-The migration channel is separate from the normal release channels so the upgrade can't be triggered by accident. You'll see OLM walk the upgrade graph one release at a time. When it's done, you'll move the subscription onto the stable channel for ongoing patches.
+In this module you'll discover the custom image, learn exactly what has to change to make a custom image work in 3.x, swap in a pre-built image that already has those changes, bump out-of-date tags, then stop every workbench so it's ready for the upgrade.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Switch the operator subscription to the `{migration-channel}` migration channel
-* Approve the OLM InstallPlans as the upgrade walks to {target-version}
-* Confirm the operator and DSC reach a healthy state on the new version
-* Move the subscription to the `{stable-channel}` channel for ongoing updates
+* Discover custom (BYON) workbench images registered in the dashboard
+* Describe the Dockerfile and configuration changes a custom image needs for 3.x
+* Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
+* Bump out-of-date image tags and stop every workbench before the upgrade
 
-== Exercise 5.1: Inspect the current subscription
+== Exercise 5.1: Discover the custom workbench image
 
-The approval mode is `Manual`, which is what you want -it forces you to approve each step rather than auto-upgrading.
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-operator get subscription rhods-operator \
-  -o jsonpath='channel={.spec.channel}{"\n"}approval={.spec.installPlanApproval}{"\n"}installedCSV={.status.installedCSV}{"\n"}'
-----
-
-[.console-output]
-----
-channel=stable-2.25
-approval=Manual
-installedCSV=rhods-operator.2.25.6
-----
-
-See which channels the catalog offers:
+List the custom (BYON) ImageStreams registered through the dashboard:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get packagemanifest rhods-operator -n openshift-marketplace \
-  -o jsonpath='{range .status.channels[*]}{.name}  {.currentCSV}{"\n"}{end}' | grep -E 'support-required-upgrade|stable-3'
+oc get imagestream -n redhat-ods-applications -l app.kubernetes.io/created-by=byon \
+  -o custom-columns='NAME:.metadata.name,URL:.metadata.annotations.opendatahub\.io/notebook-image-url'
 ----
 
 [.console-output]
 ----
-stable-3.3                 rhods-operator.3.3.3
-stable-3.x                 rhods-operator.3.4.0
-support-required-upgrade   rhods-operator.3.3.3
+NAME                    URL
+custom-scipy-notebook   {legacy-workbench-image}
 ----
+
+The image is `{legacy-workbench-image}` -an upstream community Jupyter image, built well before RHOAI 3.x existed. It will not work as-is after the upgrade.
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='{.spec.installPlanApproval}{"\n"}'
+oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
+  -o jsonpath='{.spec.tags[0].from.name}{"\n"}'
 ----
 
-✓ Output is `Manual` -InstallPlans will wait for your approval
+✓ The ImageStream points at the legacy community image
 
-== Exercise 5.2: Switch to the migration channel
+== Exercise 5.2: Why this image breaks in 3.x
 
-[.console-input]
-[source,role="execute"]
+A custom workbench image built for 2.x makes two assumptions that 3.x breaks:
+
+. *Authentication.* In 2.x, each workbench pod ran an `oauth-proxy` sidecar tightly coupled to the internal OpenShift OAuth server. In 3.x, the platform injects `kube-rbac-proxy` instead. An image that bakes in oauth-proxy configuration fights the platform and produces redirect loops.
+. *Routing.* In 2.x, workbenches were exposed through OpenShift Routes. In 3.x they're exposed through Kubernetes Gateway API with *path-based* routing, where every workbench lives under a path prefix carried in the `NB_PREFIX` environment variable. An image whose web server ignores `NB_PREFIX` -or strips it from redirects -produces "page not found" once it's behind the Gateway.
+
+The fix is a *rebuild* of the image, not a configuration tweak on the cluster. Red Hat does not auto-rebuild custom images -this is an application-owner task.
+
+== Exercise 5.3: How the image was updated for 3.x
+
+The rebuild has already been done for you and the result is published at `quay.io/hayesphilip/rhoai-workbench-gw:3.x`. This exercise walks through *exactly* what changed in the Containerfile so you can do the same for your own images. Both the original 2.x BYON Containerfile (`examples/custom-workbench-2x/Containerfile`) and the rebuilt 3.x one (`examples/custom-workbench-gw/Containerfile`) ship with the workshop repo.
+
+=== The two changes that make a Jupyter image 3.x-ready
+
+. *No oauth-proxy.* RHOAI 3.x injects `kube-rbac-proxy` at the platform level. Any `oauth-proxy` binary, config, or sidecar wiring in the image must be deleted -the image only needs to serve the notebook on its own port. The 2.x image relied on a platform-injected oauth-proxy sidecar plus the upstream `start-notebook.sh` entrypoint, which is exactly what produces redirect loops under 3.x.
+. *`NB_PREFIX`-aware entrypoint.* The notebook controller injects the workbench's path prefix in `NB_PREFIX` (e.g. `/notebook/<ns>/<name>`). Under 3.x, workbenches are exposed through Kubernetes Gateway API with path-based routing, so the notebook server must serve under that prefix *and* must not strip it from redirects. The fix for a Jupyter image is to pass `NB_PREFIX` to `--ServerApp.base_url` at launch.
+
+=== The Containerfile diff
+
+The lab's 2.x and 3.x Containerfiles are otherwise identical (same `FROM`, same packages, same UID workaround). The only meaningful changes:
+
+[source,diff]
 ----
-oc -n redhat-ods-operator patch subscription rhods-operator --type=merge -p '{
-  "spec": { "channel": "support-required-upgrade" }
-}'
-----
+  FROM quay.io/jupyter/scipy-notebook:lab-4.2.5
 
-Confirm OLM generates an InstallPlan:
+  LABEL io.opendatahub.notebooks="true" \
+        io.openshift.expose-services="8888:http" \
+        ...
 
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-operator get installplan \
-  -o custom-columns='NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[0],APPROVED:.spec.approved'
-----
+  USER root
+  RUN pip install --no-cache-dir 'mlflow~=2.9' 'onnxruntime~=1.17'
+  RUN chgrp -R 0 /home/jovyan && chmod -R g=u /home/jovyan
 
-=== Verify
++ # Install the RHOAI-aware entrypoint that honors NB_PREFIX.
++ COPY start-rhoai-notebook.sh /usr/local/bin/start-rhoai-notebook.sh
++ RUN chmod +x /usr/local/bin/start-rhoai-notebook.sh
 
-[.console-input]
-[source,role="execute"]
-----
-oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='channel={.spec.channel}{"\n"}'
-----
-
-[.console-output]
-----
-channel=support-required-upgrade
-----
-
-✓ The subscription is on the migration channel and an unapproved InstallPlan exists
-
-== Exercise 5.3: Approve the upgrade
-
-[IMPORTANT]
-====
-OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.6` you'll see *one* InstallPlan (`2.25.6` to `3.3.3`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
-====
-
-This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
-
-[.console-input]
-[source,role="execute"]
-----
-deadline=$(( $(date +%s) + 1800 ))
-while (( $(date +%s) < deadline )); do
-  IP=$(oc -n redhat-ods-operator get installplan -o json \
-    | jq -r '.items[] | select(.spec.approved==false) | .metadata.name' | head -1)
-  if [ -n "$IP" ]; then
-    echo "Approving InstallPlan $IP ..."
-    oc -n redhat-ods-operator patch installplan "$IP" --type=merge -p '{"spec":{"approved":true}}'
-    sleep 30
-    continue
-  fi
-  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.3 -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo "rhods-operator.3.3.3 phase: ${phase:-<pending>}"
-  [ "$phase" = "Succeeded" ] && break
-  sleep 30
-done
+  USER ${NB_UID}
+  EXPOSE 8888
+- # (no ENTRYPOINT — inherits upstream start-notebook.sh which ignores NB_PREFIX)
++ ENTRYPOINT ["/usr/local/bin/start-rhoai-notebook.sh"]
 ----
 
-When it exits, check the CSV:
+The entrypoint script itself is short -its whole job is launching Jupyter with the controller-supplied prefix as the base URL:
 
-[.console-input]
-[source,role="execute"]
+[source,bash]
 ----
-oc get csv -n redhat-ods-operator | grep rhods-operator
-----
+#!/bin/bash
+set -euo pipefail
 
-[.console-output]
-----
-rhods-operator.3.3.3   Red Hat OpenShift AI   3.3.3   rhods-operator.2.25.6   Succeeded
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayName=="Red Hat OpenShift AI")]}{.metadata.name} {.status.phase}{"\n"}{end}'
+exec jupyter lab \
+  --ServerApp.base_url="${NB_PREFIX:-/}" \
+  --ServerApp.ip=0.0.0.0 \
+  --ServerApp.port=8888 \
+  --ServerApp.token='' \
+  --ServerApp.password='' \
+  --ServerApp.allow_origin='*' \
+  --ServerApp.open_browser=False \
+  --ServerApp.quit_button=False
 ----
 
-✓ `rhods-operator.3.3.3` is `Succeeded` and no `rhods-operator.2.*` CSV remains
+The Containerfile and entrypoint script are in `examples/custom-workbench-gw/` in the workshop repo -use them as the starting template for your own custom images.
 
-== Exercise 5.4: Wait for the DSC and DSCI to settle
+=== Build + push (reference only — already done for you)
 
-The new operator reconciles the DSC and DSCI under the 3.x model. Wait for both to return to `Ready`:
-
-[.console-input]
-[source,role="execute"]
+[source,bash]
 ----
-oc wait --for=jsonpath='{.status.phase}'=Ready dsc/default-dsc --timeout=20m
-oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
-----
-
-[.console-output]
-----
-datasciencecluster.datasciencecluster.opendatahub.io/default-dsc condition met
-DSCI phase: Ready
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
-oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
-----
-
-[.console-output]
-----
-DSC: Ready
-DSCI: Ready
-----
-
-✓ Both the DSC and DSCI are `Ready` under {target-version}
-
-== Exercise 5.5: Move off the migration channel
-
-The `{migration-channel}` channel is a one-shot trigger -it does not advance to later 3.3.x patch releases. Leaving the subscription there means no ongoing z-stream updates. Move it to the stable 3.3 channel:
-
-[.console-input]
-[source,role="execute"]
-----
-oc patch subscription rhods-operator -n redhat-ods-operator --type=merge -p '{
-  "spec": { "channel": "stable-3.3" }
-}'
+cd examples/custom-workbench-gw/
+podman build --platform linux/amd64 -t quay.io/hayesphilip/rhoai-workbench-gw:3.x -f Containerfile .
+podman push quay.io/hayesphilip/rhoai-workbench-gw:3.x
 ----
 
 [NOTE]
 ====
-Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (which would eventually offer a 3.4 minor upgrade -a separate planning decision).
+*Three gotchas worth knowing:*
+
+* *Platform* — the `--platform linux/amd64` flag matters. Lab clusters are amd64; a default `podman build` on Apple Silicon produces an arm64 image that fails on the cluster with `exec /usr/bin/tini: Exec format error`.
+* *Base image* — production builds should rebase on UBI9 + Python from `registry.redhat.io`. The lab uses the community `quay.io/jupyter/scipy-notebook` base, which is the pragmatic path most BYON authors take.
+* *NGINX-fronted images* (code-server, RStudio) need two extra fixes that Jupyter doesn't: keep `NB_PREFIX` in every `Location:` redirect header, and serve `/api` as a 302 instead of an inline rewrite to avoid 403s.
+====
+
+== Exercise 5.4: Re-register the ImageStream with the 3.x-ready image
+
+Point the custom ImageStream at the rebuilt image so any workbench created from it uses the 3.x-compatible version. Import the new image as a tag:
+
+[.console-input]
+[source,role="execute"]
+----
+oc tag quay.io/hayesphilip/rhoai-workbench-gw:3.x \
+  custom-scipy-notebook:3.x \
+  -n redhat-ods-applications \
+  --reference-policy=local
+----
+
+Update the BYON registration annotation so the dashboard shows the new image URL:
+
+[.console-input]
+[source,role="execute"]
+----
+oc annotate imagestream custom-scipy-notebook -n redhat-ods-applications \
+  opendatahub.io/notebook-image-url="quay.io/hayesphilip/rhoai-workbench-gw:3.x" --overwrite
+----
+
+`--reference-policy=local` pins the ImageStream to the cluster's internal registry. If you host your custom image there, also grant `system:image-puller` to the workbench ServiceAccount for `redhat-ods-applications`.
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
+  -o jsonpath='{range .status.tags[*]}{.tag}{"\n"}{end}'
+----
+
+✓ A `3.x` tag now exists on the `custom-scipy-notebook` ImageStream
+
+== Exercise 5.5: Bump out-of-date image tags
+
+Some out-of-the-box images break on old tags under 3.x. The most common is `code-server`, which must be on the `2025.2` tag. Find any workbench on an older tag:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebooks -A -o json | jq -r '.items[]
+  | select(.spec.template.spec.containers[0].image | test("code-?server"))
+  | "\(.metadata.namespace)/\(.metadata.name)  \(.spec.template.spec.containers[0].image)"'
+----
+
+If any are on `2025.1` or older, bump every one in a single loop -no per-notebook copy/paste, no placeholders to fill in:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebooks -A -o json \
+  | jq -r '.items[]
+      | select(.spec.template.spec.containers[0].image | test("code-?server"))
+      | select(.spec.template.spec.containers[0].image | test(":2025\\.[01]$"))
+      | "\(.metadata.namespace)/\(.metadata.name)"' \
+  | while read -r nb; do
+      NS="${nb%/*}"; NAME="${nb##*/}"
+      echo "Bumping $NS/$NAME to code-server-notebook:2025.2"
+      oc patch notebook "$NAME" -n "$NS" --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"image-registry.openshift-image-registry.svc:5000/redhat-ods-applications/code-server-notebook:2025.2"}]'
+    done
+----
+
+For this lab the loop will hit `workbenches-regular/codeserver-2025-1` and bump it. If your shell paste truncates the multi-line loop, paste it inside `bash -c '...'` to keep zsh from re-parsing line-by-line.
+
+[NOTE]
+====
+*RStudio is not in this lab's install, but is common in production.* RStudio workbenches are built per-cluster from a BuildConfig, must use the `latest` tag, and need a new build *after* the upgrade. If your cluster has RStudio workbenches, plan that work into the post-upgrade window. Jupyter-based images are generally compatible, but bumping to `2025.2` is recommended.
 ====
 
 === Verify
@@ -202,42 +205,87 @@ Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (
 [.console-input]
 [source,role="execute"]
 ----
-oc get subscription rhods-operator -n redhat-ods-operator \
-  -o jsonpath='channel={.spec.channel}  state={.status.state}  installedCSV={.status.installedCSV}{"\n"}'
+oc get notebooks -A -o json | jq -r '.items[]
+  | select(.spec.template.spec.containers[0].image | test("code-?server"))
+  | "\(.metadata.name): \(.spec.template.spec.containers[0].image | split(":")[-1])"'
+----
+
+✓ Any code-server workbench is on tag `2025.2` (or there are none on this cluster)
+
+== Exercise 5.6: Stop every workbench
+
+All workbenches must be stopped before the upgrade -running workbenches built for the 2.x auth model hit redirect loops during the transition. The notebook controller treats the `kubeflow-resource-stopped` annotation as "stopped if present"; the dashboard sets it to a timestamp, so use one here.
+
+Survey what's running (by pod count, the reliable signal):
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb has $pods pod(s) running"
+done
+----
+
+Stop every workbench:
+
+[.console-input]
+[source,role="execute"]
+----
+STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
+  ns="${row%/*}"; name="${row##*/}"
+  oc -n "$ns" annotate notebook "$name" \
+    kubeflow-resource-stopped="$STAMP" --overwrite
+done
+----
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  pods=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pods" -gt 0 ] && echo "$nb still has $pods pod(s)"
+done
+echo "survey complete"
 ----
 
 [.console-output]
 ----
-channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.3
+survey complete
 ----
 
-✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.3`
+✓ No workbench reports running pods
 
 == Troubleshooting
 
-*Issue*: The approval loop times out without reaching `Succeeded`.
+*Issue*: `oc tag` reports it can't reach the image.
 
-*Solution*: Check the operator logs with `oc logs -n redhat-ods-operator deploy/rhods-operator --tail=50`. A stuck InstallPlan usually means a removed component was left `Managed` -re-run the Module 1 assessment to find which one, fix it, and the upgrade resumes.
+*Solution*: Confirm the image URL is correct and public, or that the cluster has a pull secret for the registry. The lab image is published at `quay.io/hayesphilip/rhoai-workbench-gw:3.x`. If it is in a private registry, add a pull secret to the `redhat-ods-applications` namespace first.
 
-*Issue*: No InstallPlan appears after the channel switch.
+*Issue*: A workbench started from the custom image still hits a redirect loop in 3.x.
 
-*Solution*: Confirm the channel name is exactly `support-required-upgrade` and that the catalog offers it: `oc get packagemanifest rhods-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
+*Solution*: The image was not rebuilt correctly -confirm oauth-proxy is fully removed and the server honors `NB_PREFIX`. Use the rebuilt `-gw` image from Exercise 5.4, not the original.
 
-*Issue*: DSC stays `Not Ready` after the upgrade.
+*Issue*: A workbench won't stop -its pod keeps coming back.
 
-*Solution*: Inspect which component is unhealthy: `oc get dsc default-dsc -o jsonpath='{.status.conditions}' | jq`. Module 6 covers verifying the platform and the Gateway.
+*Solution*: Confirm the annotation applied: `oc get notebook <name> -n <ns> -o jsonpath='{.metadata.annotations.kubeflow-resource-stopped}'`. The controller treats *any* non-empty value as stopped -use a timestamp, not the literal `true`.
 
 == Learning outcomes
 
-You've completed the upgrade. You can:
+You've completed the workbench phase. You can:
 
-* [x] Switch the subscription to the `{migration-channel}` migration channel
-* [x] Approve the OLM upgrade as it walks to {target-version}
-* [x] Confirm the operator, DSC, and DSCI are healthy on the new version
-* [x] Move the subscription to `{stable-channel}` for ongoing updates
+* [x] Discover BYON ImageStreams registered in the dashboard
+* [x] Describe the Dockerfile and config changes a custom image needs for 3.x
+* [x] Re-register a custom ImageStream to point at a rebuilt, 3.x-ready image
+* [x] Bump out-of-date tags and stop every workbench before the upgrade
 
 == Module summary
 
-The operator is now on {target-version}, the DSC and DSCI are `Ready`, and the subscription is on the stable channel. In the final module you'll verify the migrated cluster end to end -especially that all four models are still serving.
+The workbenches are handled: the custom image is re-registered to a 3.x-ready build, out-of-date tags are bumped, and every workbench is stopped. The cluster is fully pre-upgrade-clean -models converted, components removed, operators gone, images updated, workbenches stopped. It's time to upgrade.
 
-Continue to *Module 6: Post-upgrade verification*.
+Continue to *Module 6: Perform the upgrade*.

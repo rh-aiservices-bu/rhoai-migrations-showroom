@@ -41,7 +41,7 @@ Before the upgrade, the dashboard is served from an OpenShift Route:
 
 [NOTE]
 ====
-After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You'll confirm this -and the matching change to model endpoint URLs -in Module 6.
+After the upgrade this URL changes. RHOAI 3.x serves the dashboard through Gateway API at `https://data-science-gateway.{openshift_cluster_ingress_domain}`. You'll confirm this -and the matching change to model endpoint URLs -in Module 7.
 ====
 
 === Command line
@@ -71,14 +71,16 @@ Your job is to carry all of it cleanly onto {target-version}.
 [cols="1,3",options="header"]
 |===
 | Module | What you'll accomplish
-| *Module 1: Assess* | Run the `rhai-cli` assessment, read its findings, and learn why a clean lint is not a workload inventory.
-| *Module 2: Convert serving* | Convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe -*before* the components that host them are removed.
-| *Module 3: Remediate platform* | Flip the removed components to `Removed`, patch the model-serving ConfigMap, remove the Service Mesh dependency, and uninstall the 2.x operators.
-| *Module 4: Workbench images* | Discover the custom workbench image, learn what a custom image needs to change for 3.x, re-register it to a rebuilt image, bump out-of-date tags, and stop every workbench.
-| *Module 5: Upgrade* | Switch to the migration channel, drive the OLM upgrade to {target-version}, then move to the stable channel.
-| *Module 6: Verify* | Confirm the platform is healthy, the converted models still serve, the schema and HardwareProfiles migrated, and workbenches are patched onto the new auth model.
+| *Module 1: Test baseline* | Exercise every user-facing workload (inference calls, workbenches, pipelines, Ray jobs) and save a baseline snapshot so you can compare before vs after.
+| *Module 2: Assess* | Run the `rhai-cli` assessment, read its findings, and learn why a clean lint is not a workload inventory.
+| *Module 3: Convert serving* | Convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe -*before* the components that host them are removed.
+| *Module 4: Remediate platform* | Flip the removed components to `Removed`, patch the model-serving ConfigMap, remove the Service Mesh dependency, and uninstall the 2.x operators.
+| *Module 5: Workbench images* | Discover the custom workbench image, learn what a custom image needs to change for 3.x, re-register it to a rebuilt image, bump out-of-date tags, and stop every workbench.
+| *Module 6: Upgrade* | Switch to the migration channel, drive the OLM upgrade to {target-version}, then move to the stable channel.
+| *Module 7: Verify* | Confirm the platform is healthy, the converted models still serve, the schema and HardwareProfiles migrated, and workbenches are patched onto the new auth model.
+| *Module 8: Re-test* | Re-run every test from Module 1 against the migrated endpoints and diff against the baseline.
 |===
 
 == Ready to begin?
 
-Open *Terminal 1* in the panel on the right, then navigate to *Module 1* to assess the cluster.
+Open *Terminal 1* in the panel on the right, then navigate to *Module 1* to capture the baseline.
