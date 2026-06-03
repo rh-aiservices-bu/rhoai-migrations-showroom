@@ -51,7 +51,7 @@ oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metada
 
 Per the migration guide, metrics are backed up with a per-namespace port-forward + `curl` (no helper script for metrics), and data storage is backed up with the official `backup-data.sh` helper (auto-detects PVC vs DATABASE). Run both for each namespace that has a TrustyAIService.
 
-Run the metrics + data backup for *both* TrustyAI service namespaces (`test-trustyaiservice` and `test-trustyaiservice-db`). The block below sets `BACKUP_DIR` explicitly -the rhai-cli image doesn't always set it for non-login shells, and an unset `BACKUP_DIR` makes `curl -o "${BACKUP_DIR}/..."` silently write to `/trustyai-metrics-*.json` at the filesystem root where the cleanup tooling won't find it.
+Run the metrics + data backup for *both* TrustyAI service namespaces (`test-trustyaiservice` and `test-trustyaiservice-db`). The block below sets `BACKUP_DIR` explicitly -the rhai-cli image doesn't always set it for non-login shells, and an unset `BACKUP_DIR` makes `curl -o "$BACKUP_DIR/..."` silently write to `/trustyai-metrics-*.json` at the filesystem root where the cleanup tooling won't find it.
 
 [.console-input]
 [source,role="execute"]
