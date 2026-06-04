@@ -77,6 +77,14 @@ oc get route -n $NS -o jsonpath='{.items[0].spec.host}'
 
 > **Cluster parameters:** the workshop expects values like `openshift_console_url`, `openshift_cluster_admin_username`, `openshift_cluster_admin_password`, and `openshift_cluster_ingress_domain` (referenced in [content/modules/ROOT/pages/index.adoc](content/modules/ROOT/pages/index.adoc)) to be supplied by the surrounding RHPDS catalog item. When running standalone, pass them via additional `--set` flags or render the AsciiDoc with substitutions handled out-of-band.
 
+## Publish to GitHub Pages
+
+A workflow at [.github/workflows/pages.yml](.github/workflows/pages.yml) builds the Antora site on every push to `main` and deploys it to GitHub Pages at https://rh-aiservices-bu.github.io/rhoai-migrations-showroom.
+
+One-time setup: in the repo's **Settings → Pages**, set **Source** to **GitHub Actions**. After the first run, the URL appears on the workflow's `deploy` job.
+
+The published site renders with the placeholder cluster parameters in [content/antora.yml](content/antora.yml) (`PLACEHOLDER-URL.com` etc.) — it's a static preview, not a live workshop instance.
+
 ## Layout
 
 ```
