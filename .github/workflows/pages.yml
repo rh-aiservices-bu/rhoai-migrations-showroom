@@ -1,9 +1,12 @@
-name: Publish to GitHub Pages
+name: github pages
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
 
 permissions:
   contents: read
@@ -11,34 +14,37 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: gh-pages
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: configure pages
+        uses: actions/configure-pages@v5
+      - name: setup node
+        uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
-      - name: Build site with Antora
-        run: npx antora default-site.yml
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+          node-version: 20.13.1
+      - name: install antora
+        run: npm install --global @antora/cli@3.1 @antora/site-generator@3.1
+      - name: antora generate
+        run: antora generate default-site.yml --stacktrace
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          path: ./www
+          path: www
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
     steps:
-      - id: deployment
+      - name: deploy github pages
+        id: deployment
         uses: actions/deploy-pages@v4
