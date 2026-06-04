@@ -25,7 +25,7 @@ This workshop assumes you already have:
 
 == Log in to the cluster
 
-Every command in this workshop runs from *Terminal 1* in the panel on the right. Log in to the cluster as `cluster-admin` using the API server URL and credentials supplied by your lab environment:
+Every command in this workshop runs from the terminal. Log in to the cluster as `cluster-admin` using the API server URL and credentials supplied by your lab environment:
 
 [.console-input]
 [source,role="execute"]
@@ -73,4 +73,4 @@ Your job is to carry all of it cleanly onto {target-version}.
 
 == Ready to begin?
 
-Open *Terminal 1* in the panel on the right, then navigate to *Module 1* to capture the baseline.
+Open the terminal, then navigate to *Module 1* to capture the baseline.
