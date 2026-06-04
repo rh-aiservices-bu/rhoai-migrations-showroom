@@ -81,7 +81,7 @@ oc get route -n $NS -o jsonpath='{.items[0].spec.host}'
 
 A workflow at [.github/workflows/pages.yml](.github/workflows/pages.yml) builds the Antora site on every push to `main` and deploys it to GitHub Pages at https://rh-aiservices-bu.github.io/rhoai-migrations-showroom.
 
-The workflow enables Pages on first run via `actions/configure-pages` (`enablement: true`), so no manual repo setup is required. After the first deploy, the URL appears on the workflow's `deploy` job.
+One-time setup: in the repo's **Settings → Pages**, set **Source** to **GitHub Actions**, then re-run the workflow. (The workflow also passes `enablement: true` to `actions/configure-pages`, which would auto-enable Pages on first run — but the `rh-aiservices-bu` org policy blocks `GITHUB_TOKEN` from creating Pages sites, so the manual toggle is required here.) After the first deploy, the URL appears on the workflow's `deploy` job.
 
 The published site renders with the placeholder cluster parameters in [content/antora.yml](content/antora.yml) (`PLACEHOLDER-URL.com` etc.) — it's a static preview, not a live workshop instance.
 
