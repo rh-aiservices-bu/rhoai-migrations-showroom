@@ -5,9 +5,9 @@
 
 With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path, so the action is delete pre-upgrade and recreate fresh post-upgrade (data archival is out of scope here). This module starts with backups, deletes the LSDs, then runs the disables, then the 3.x prerequisites, then operator uninstalls.
 
-In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 7, update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, install Red Hat Connectivity Link (RHCL) as the 3.x llm-d auth plane, freeze the LLMInferenceService templates, and finally uninstall the 2.x serving operators.
+In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 7, update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, and finally uninstall the 2.x serving operators.
 
-Order matters throughout. Back up RayClusters *before* disabling Ray. The `inferenceservice-config` ConfigMap must be updated *after* every ISVC is RawDeployment but *before* the disables, so the upgrade reconciler honours the new ignorelist. KServe Serverless must drain before you remove the Service Mesh v2 dependency. The Service Mesh member roll has to be deleted before its operator can be uninstalled. And RHCL must be up *before* you uninstall the standalone Authorino, or LLMInferenceService loses auth for the duration of the window.
+Order matters throughout. Back up RayClusters *before* disabling Ray. The `inferenceservice-config` ConfigMap must be updated *after* every ISVC is RawDeployment but *before* the disables, so the upgrade reconciler honours the new ignorelist. KServe Serverless must drain before you remove the Service Mesh v2 dependency. The Service Mesh member roll has to be deleted before its operator can be uninstalled.
 
 == Learning objectives
 
@@ -17,8 +17,6 @@ By the end of this module, you'll be able to:
 * Update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist
 * Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`
 * Remove the Service Mesh v2 dependency including the lingering member roll
-* Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
-* Freeze the LLMInferenceService scheduler/router templates against the 3.x rewrite
 * Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
 
 == Exercise 4.1: Back up the RayClusters
@@ -359,222 +357,16 @@ oc delete smmr default -n istio-system --ignore-not-found
 
 ✓ Both the SMCP and SMMR are gone. The Service Mesh operator itself is uninstalled in Exercise 4.13.
 
-== Exercise 4.11: Install Red Hat Connectivity Link for llm-d
+== Exercise 4.11: Uninstall the 2.x serving operators
 
-RHOAI 3.x routes LLMInferenceService (llm-d) traffic through Kubernetes Gateway API with *Red Hat Connectivity Link* (RHCL -upstream: Kuadrant) as the consolidated auth/policy plane. RHCL replaces the standalone Authorino that came in with the Serverless stack.
-
-Install RHCL *before* uninstalling the standalone Authorino (Exercise 4.13), or you'll drop auth for any LLMInferenceService for the duration of the window.
-
-=== Sub-step A: Install the RHCL operator (AllNamespaces, into `openshift-operators`)
-
-The RHCL operator must be installed *AllNamespaces*, with the Subscription in `openshift-operators`. The `kuadrant-system` namespace is created separately and used only for the Kuadrant CR + Authorino TLS resources -*not* for the Subscription.
-
-[IMPORTANT]
-====
-Earlier RHOAI 2.25 → 3.3 migration documentation directed installing RHCL into `kuadrant-system` with mode "A specific namespace on the cluster". That fails on RHCL v1.3.3:
-
-----
-phase: Failed
-reason: UnsupportedOperatorGroup
-message: OwnNamespace InstallModeType not supported, cannot configure to watch own namespace
-----
-
-The bundled `dns-operator` and `limitador-operator` CSVs Fail with the same error. Authorino's own CSV happens to succeed because Authorino does support OwnNamespace, but it's stranded without the rest of the bundle. RHCL v1.3.3 supports AllNamespaces only -install into `openshift-operators`.
-====
+OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies of the 2.x KServe Serverless stack. With that stack removed, uninstall them.
 
 [.console-input]
 [source,role="execute"]
 ----
-oc create ns kuadrant-system 2>/dev/null || true
-
-oc apply -f - <<'EOF'
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata: { name: rhcl-operator, namespace: openshift-operators }
-spec:
-  channel: stable
-  name: rhcl-operator
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-  installPlanApproval: Automatic
-EOF
-----
-
-`openshift-operators` ships an AllNamespaces OperatorGroup by default, so no OperatorGroup needs to be applied. Wait for the RHCL CSV (and the dns / limitador / authorino dependencies it pulls in) to reach `Succeeded`:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get csv -n openshift-operators | grep -iE "rhcl|dns-operator|limitador|authorino"
-----
-
-Re-run until you see four `Succeeded` rows. Expected end state:
-
-[.console-output]
-----
-authorino-operator.v1.3.0     Authorino Operator                 1.3.0      authorino-operator.v1.2.4     Succeeded
-dns-operator.v1.3.0           DNS Operator                       1.3.0      dns-operator.v1.2.0           Succeeded
-limitador-operator.v1.3.0     Limitador Operator                 1.3.0      limitador-operator.v1.2.0     Succeeded
-rhcl-operator.v1.3.3          Red Hat Connectivity Link          1.3.3      rhcl-operator.v1.3.2          Succeeded
-----
-
-=== Sub-step B: Create the Kuadrant CR and enable TLS on Authorino
-
-Create the Kuadrant CR. RHCL provisions Authorino and Limitador in response:
-
-[.console-input]
-[source,role="execute"]
-----
-oc apply -f - <<'EOF'
-apiVersion: kuadrant.io/v1beta1
-kind: Kuadrant
-metadata: { name: kuadrant, namespace: kuadrant-system }
-EOF
-----
-
-Check Kuadrant's current state:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.status.conditions}' | jq
-----
-
-Annotate the Authorino service so OpenShift's built-in service signer issues the listener cert (no cert-manager involved -OCP's internal CA mints `authorino-server-cert` automatically):
-
-[.console-input]
-[source,role="execute"]
-----
-oc annotate svc/authorino-authorino-authorization \
-  service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
-  -n kuadrant-system
-
-sleep 2
-----
-
-Apply the Authorino CR with TLS on the **listener only** -the migration guide explicitly leaves `oidcServer.tls.enabled` *off*:
-
-[.console-input]
-[source,role="execute"]
-----
-oc apply -f - <<'EOF'
-apiVersion: operator.authorino.kuadrant.io/v1beta1
-kind: Authorino
-metadata:
-  name: authorino
-  namespace: kuadrant-system
-spec:
-  replicas: 1
-  clusterWide: true
-  listener:
-    tls:
-      enabled: true
-      certSecretRef:
-        name: authorino-server-cert
-  oidcServer:
-    tls:
-      enabled: false
-EOF
-
-oc wait --for=condition=ready pod -l authorino-resource=authorino -n kuadrant-system --timeout=150s
-----
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get csv -n openshift-operators | grep -iE "rhcl|dns-operator|limitador|authorino"
-oc get authorino authorino -n kuadrant-system -o jsonpath='listener-tls={.spec.listener.tls.enabled} oidc-tls={.spec.oidcServer.tls.enabled}{"\n"}'
-oc get pods -n kuadrant-system -l authorino-resource=authorino
-oc get secret authorino-server-cert -n kuadrant-system
-----
-
-Expect: four `Succeeded` CSVs (`rhcl-operator`, `dns-operator`, `limitador-operator`, `authorino-operator`), `listener-tls=true oidc-tls=false`, one Authorino pod `Running 1/1`, the `authorino-server-cert` Secret present and minted by OpenShift's service signer.
-
-The real proof that this exercise is done is the rhai-cli lint:
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
-  | grep -iE "kuadrant-readiness|authorino-tls-readiness"
-----
-
-✓ Every `kuadrant-readiness` and `authorino-tls-readiness` row is `✓ info` (Kuadrant installed and ready; Authorino TLS enabled with certificate secret `authorino-server-cert`). Kuadrant's CR may still report `Ready=False` -that's expected pre-upgrade; the lint only requires the resource to exist
-
-== Exercise 4.12: Freeze the LLMInferenceService template annotations
-
-Per migration guide §2.8.10.4, pin every LLMInferenceService to the 2.25 template names to prevent scheduler pod failures during the upgrade. The guide applies the pins on the `status` subresource (not `metadata.annotations`); the workshop does the same.
-
-Enumerate the LLMInferenceServices:
-
-[.console-input]
-[source,role="execute"]
-----
-oc get llminferenceservice -A
-----
-
-[.console-output]
-----
-NAMESPACE       NAME           URL   READY   REASON                       AGE
-llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
-----
-
-Apply the eight template pins to each LLMInferenceService (`llmisvc` is the short kind name):
-
-[.console-input]
-[source,role="execute"]
-----
-oc patch llmisvc my-llm-model -n llm-project-a --subresource=status --type=merge -p '{
-  "status": {
-    "annotations": {
-      "serving.kserve.io/config-llm-template":                        "kserve-config-llm-template",
-      "serving.kserve.io/config-llm-decode-template":                 "kserve-config-llm-decode-template",
-      "serving.kserve.io/config-llm-worker-data-parallel":            "kserve-config-llm-worker-data-parallel",
-      "serving.kserve.io/config-llm-decode-worker-data-parallel":     "kserve-config-llm-decode-worker-data-parallel",
-      "serving.kserve.io/config-llm-prefill-template":                "kserve-config-llm-prefill-template",
-      "serving.kserve.io/config-llm-prefill-worker-data-parallel":    "kserve-config-llm-prefill-worker-data-parallel",
-      "serving.kserve.io/config-llm-scheduler":                       "kserve-config-llm-scheduler",
-      "serving.kserve.io/config-llm-router-route":                    "kserve-config-llm-router-route"
-    }
-  }
-}'
-----
-
-[NOTE]
-====
-On this cluster `my-llm-model` is `Ready=False` -that's a model-level health issue (typically a missing GPU resource or model artifact), not a migration concern. The template freeze applies regardless of whether the workload is currently serving; it pins the scheduler's behaviour for after the upgrade.
-====
-
-=== Verify
-
-[.console-input]
-[source,role="execute"]
-----
-oc get llmisvc my-llm-model -n llm-project-a -o jsonpath='{.status.annotations}' | jq 'to_entries | map(select(.key | startswith("serving.kserve.io/config-llm-"))) | length'
-----
-
-[.console-output]
-----
-8
-----
-
-✓ All eight `serving.kserve.io/config-llm-*` annotations are pinned on the LLMInferenceService
-
-== Exercise 4.13: Uninstall the 2.x serving operators
-
-OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies of the 2.x KServe Serverless stack. With that stack removed -and RHCL up to take over auth -uninstall them.
-
-[.console-input]
-[source,role="execute"]
-----
-# Standalone Authorino: delete the Subscription only, do NOT delete the CSV.
-# Background (see IMPORTANT block below): RHCL is also installed into
-# openshift-operators, so OLM has deduped both Subscriptions to a single shared
-# authorino-operator CSV. Removing the CSV would tear down RHCL Authorino too.
+# Standalone Authorino
 oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
+oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
 
 # OpenShift Serverless
 oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
@@ -584,13 +376,6 @@ oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | 
 oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
 oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
 ----
-
-[IMPORTANT]
-====
-Since Exercise 4.11 installs RHCL into `openshift-operators` as well (AllNamespaces is the only mode RHCL v1.3.3 supports), the standalone Authorino Subscription and the RHCL Subscription both point at the same `authorino-operator` package -OLM has deduped them to a single `authorino-operator.v1.3.0` CSV. Deleting that CSV would break RHCL. The Subscription delete is enough: with the standalone Subscription gone, OLM keeps the CSV alive on RHCL's behalf, and RHCL's Authorino CR keeps serving LLMInferenceService auth.
-
-If you want to verify after the delete: `oc get csv -n openshift-operators | grep authorino` should still show `authorino-operator.v1.3.0  Succeeded`.
-====
 
 === Verify
 
@@ -608,7 +393,7 @@ echo "--- check complete ---"
 
 ✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
 
-== Exercise 4.14: Re-run the assessment
+== Exercise 4.12: Re-run the assessment
 
 Re-run the lint and confirm zero critical findings:
 
@@ -626,15 +411,7 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 
 *Issue*: `oc delete smmr` hangs.
 
-*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Delete the SMMR *before* uninstalling the operator in Exercise 4.13. If you already uninstalled it, reinstall it briefly so the finalizer can process, then delete the SMMR.
-
-*Issue*: Kuadrant CR is stuck at `Ready=False` with `MissingDependency` for a Gateway API provider.
-
-*Solution*: On a clean OCP 4.20+ cluster the Cluster Ingress Operator installs and manages `servicemeshoperator3` as the Gateway API provider -confirm with `oc get csv -n openshift-operators | grep servicemeshoperator3` (expect `Succeeded`). If the CSV is missing or `Failed` on a *disconnected* cluster, you skipped the §2.8.10.2 mirror step -mirror the SMv3 image into your registry and re-check. On a connected cluster a missing SMv3 CSV usually means the Cluster Ingress Operator itself is unhealthy; investigate `openshift-ingress-operator` before doing anything else.
-
-*Issue*: `authorino-tls-readiness` still fails after Exercise 4.11.
-
-*Solution*: Confirm the `authorino-server-cert` Secret was minted by OpenShift's service signer: `oc get secret authorino-server-cert -n kuadrant-system`. If it's missing, the `service.beta.openshift.io/serving-cert-secret-name` annotation didn't take -re-run `oc annotate svc/authorino-authorino-authorization ...` from Sub-step B. The Authorino CR's `listener.tls.enabled` must be `true`; `oidcServer.tls.enabled` must stay `false` (the migration guide intentionally leaves it off).
+*Solution*: The member roll's finalizer is processed by the Service Mesh 2 operator. Delete the SMMR *before* uninstalling the operator in Exercise 4.11. If you already uninstalled it, reinstall it briefly so the finalizer can process, then delete the SMMR.
 
 *Issue*: A converted model goes `READY=False` during the Serverless teardown.
 
@@ -651,12 +428,10 @@ You've completed the platform remediation. You can:
 * [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
 * [x] Flip every removed component to `Removed` in the correct order
 * [x] Remove the Service Mesh v2 dependency including the lingering member roll
-* [x] Install Red Hat Connectivity Link with TLS-enabled Authorino as the llm-d auth plane
-* [x] Freeze every LLMInferenceService against the 3.x template rewrite
 * [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary
 
-The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, RHCL is up as the new llm-d auth plane, every LLMInferenceService is template-pinned, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
 
 Continue to *Module 5: Handle the workbench images*.

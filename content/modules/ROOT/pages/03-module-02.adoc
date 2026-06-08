@@ -128,8 +128,6 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ✓       dsc                     platform    readiness                     info      DataScienceCluster is ready
 ✓       dsci                    platform    readiness                     info      DSCInitialization is ready
 ⚠       datasciencepipelines    component   renaming                      warning   DataSciencePipelines component will be renamed to AIPipelines in DSC v2 (RHOAI 3.3)
-✗       kserve                  component   authorino-tls-readiness       critical  Authorino resource not found. Authorino with TLS must be installed for llm-d
-✗       kserve                  component   kuadrant-readiness            critical  Kuadrant resource not found. Kuadrant must be installed for llm-d
 ✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.3
 ✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.3
 ⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.16) is installed but no longer required
@@ -154,13 +152,13 @@ Environment:
   OpenShift version:    4.20.23
 
 Summary:
-  Total: 42 | Passed: 21 | Warnings: 10 | Failed: 11 | Prohibited: 0
+  Total: 40 | Passed: 21 | Warnings: 10 | Failed: 9 | Prohibited: 0
 
 Result:
   FAIL - blocking findings detected
 ----
 
-The full report has 42 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
+The full report has 40 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
 
 Save the full report for the record:
 
@@ -175,9 +173,8 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 
 The `IMPACT` column is what matters. rhai-cli emits four levels (`prohibited`, `critical`, `warning`, `info`); on this cluster the report has `critical`, `warning`, and `info`:
 
-* *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in three shapes:
+* *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in two shapes:
 ** *Components 3.x removes* -*KServe Serverless*, *Service Mesh v2*, *ModelMesh Serving*, *CodeFlare*, *Kueue*. You disable each in Module 4 after you've migrated its workloads in Module 3.
-** *3.x prerequisites that aren't installed yet* -*Red Hat Connectivity Link* (Authorino with TLS + Kuadrant for llm-d). You install this in Module 4.
 ** *Workload findings* you must act on -*Serverless* / *ModelMesh* InferenceServices, the *ModelMesh ServingRuntime*, and the *LlamaStackDistribution*. You convert / delete these in Module 3 (model serving) and Module 4 (LSD).
 * *`warning`* (`⚠`) - things the migration handles automatically *or* that need action but won't block the upgrade by themselves. Examples here: the `datasciencepipelines` → `aipipelines` schema-rename warning (forward-looking — flagged here by the lint but not actually shipped yet in {target-version}; see Module 7 Exercise 7.4), the `inferenceservice-config` ConfigMap patch (you'll run a helper in Module 4), the 4 running workbenches that must be stopped before the upgrade (Module 5), the 2 RayClusters needing pre-upgrade backup (Module 4), the GuardrailsOrchestrator otelExporter migration (Module 7).
 * *`info`* (`✓`) - the check passed; nothing to do.
@@ -196,7 +193,7 @@ oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -iE 'critical|warning'
 ----
 
-✓ You can see the eleven critical (`✗`) findings and the ten warning (`⚠`) findings
+✓ You can see the nine critical (`✗`) findings and the ten warning (`⚠`) findings
 
 == Exercise 2.4: The assessment is not a workload inventory
 
@@ -240,25 +237,20 @@ oc get servingruntime -A -o json | jq -r '.items[] | select(.spec.multiModel==tr
 ml-project-c/ovms-mm
 ----
 
-LLMInferenceService (llm-d) and LlamaStackDistribution are *separate CRDs* from `InferenceService` -they don't appear in the `oc get isvc` table above and they're the workloads driving the `authorino-tls-readiness`, `kuadrant-readiness`, and `llamastackdistribution / config` blockers from Exercise 2.3:
+LlamaStackDistribution is a *separate CRD* from `InferenceService` -it doesn't appear in the `oc get isvc` table above and it's the workload driving the `llamastackdistribution / config` blocker from Exercise 2.3:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get llminferenceservice -A
 oc get llamastackdistribution -A
 ----
 
 [.console-output]
 ----
-NAMESPACE       NAME           URL   READY   REASON                       AGE
-llm-project-a   my-llm-model         False   MinimumReplicasUnavailable   90m
-
 NAMESPACE             NAME                    PHASE          OPERATOR VERSION
 ldap-user17-rag-225   lsd-llama-milvus-2323   Initializing   "0.3.0"
 ----
 
-* `llm-project-a/my-llm-model` is an LLMInferenceService (the 3.x distributed-inference CRD). 3.x routes its traffic through Gateway API with Kuadrant + Authorino -*neither of which is installed yet*. You'll install Red Hat Connectivity Link in Module 4 and pin its template annotations so the 3.x upgrade doesn't rewrite them under a running scheduler.
 * `ldap-user17-rag-225/lsd-llama-milvus-2323` is a Llama Stack Distribution. 3.x moves Llama Stack from SQLite to PostgreSQL with no in-place data migration path. You'll delete this LSD in Module 4 (data archival is out of scope here) and deploy a fresh 3.x-shaped LSD in Module 7.
 
 The other 3.x-affected components on this cluster (each lives in its own namespace and follows its own migration path -don't assume the model-serving inventory above is exhaustive):
@@ -329,7 +321,7 @@ BYON ImageStreams:
        1
 ----
 
-Four workbenches and one custom (BYON) workbench image -every migration concern in one cluster: Serverless models, a ModelMesh model, an LLMInferenceService (llm-d), a LlamaStackDistribution, a custom workbench image, and workbenches that have to be stopped before the upgrade.
+Four workbenches and one custom (BYON) workbench image -every migration concern in one cluster: Serverless models, a ModelMesh model, a LlamaStackDistribution, a custom workbench image, and workbenches that have to be stopped before the upgrade.
 
 === Verify
 
@@ -360,6 +352,6 @@ You've completed the assessment phase. You can:
 
 == Module summary
 
-The cluster has eleven critical findings (component removals + 3.x prerequisites + workload conversions), ten warnings, and live workloads behind nearly every blocker. You cannot clear the Serverless and ModelMesh component criticals until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 4 then runs the rest of the platform prep -backups, ConfigMap update, RHCL install, LSD delete, and the operator uninstalls.
+The cluster has nine critical findings (component removals + workload conversions), ten warnings, and live workloads behind nearly every blocker. You cannot clear the Serverless and ModelMesh component criticals until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 4 then runs the rest of the platform prep -backups, ConfigMap update, LSD delete, and the operator uninstalls.
 
 Continue to *Module 3: Convert the model-serving workloads*.
