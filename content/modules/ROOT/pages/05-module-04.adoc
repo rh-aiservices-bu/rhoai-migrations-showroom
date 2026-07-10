@@ -345,13 +345,15 @@ oc patch dsci default-dsci --type=merge -p '{
 }'
 ----
 
-Poll for the SMCP to drain, then delete the leftover ServiceMeshMemberRoll (the DSCI change drains the SMCP but leaves the SMMR with a `maistra.io/istio-operator` finalizer that only the still-installed Service Mesh operator can clear):
+Wait for the SMCP to drain, then delete the leftover ServiceMeshMemberRoll (the DSCI change drains the SMCP but leaves the SMMR with a `maistra.io/istio-operator` finalizer that only the still-installed Service Mesh operator can clear):
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get smcp -A
-# Re-run until "No resources found", then:
+until [ -z "$(oc get smcp -A --no-headers 2>/dev/null)" ]; do
+  echo "Waiting for SMCP to drain..."
+  sleep 5
+done
 oc delete smmr default -n istio-system --ignore-not-found
 ----
 
