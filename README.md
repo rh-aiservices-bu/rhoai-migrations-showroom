@@ -28,6 +28,7 @@ The fastest loop for editing content is the [antora-viewer](https://github.com/j
 ```sh
 podman run --rm --name antora \
   -v $PWD:/antora \
+  -e ANTORA_CONFIG=site.yaml \
   -p 8080:8080 \
   -it ghcr.io/juliaaano/antora-viewer
 ```
@@ -37,7 +38,7 @@ Docker works too — swap `podman` for `docker`.
 To produce a static build without the live viewer:
 
 ```sh
-npx antora default-site.yml
+npx antora site.yaml
 ```
 
 The output is written to [www/](www/) and can be served by any static web server.
@@ -63,9 +64,10 @@ helm upgrade --install rhoai-migrations-showroom \
   --set general.catalogItem=prod \
   --set deployer.domain=$(oc get ingresses.config cluster -o jsonpath='{.spec.domain}')
 
-# Point the content pod at this repo (works around the chart bug)
+# Point the content pod at this repo and the renamed playbook
 oc -n $NS set env deployment/showroom-content \
-  GIT_REPO_URL=https://github.com/rh-aiservices-bu/rhoai-migrations-showroom.git
+  GIT_REPO_URL=https://github.com/rh-aiservices-bu/rhoai-migrations-showroom.git \
+  ANTORA_PLAYBOOK=site.yaml
 oc -n $NS rollout restart deployment/showroom-content
 ```
 
@@ -90,7 +92,7 @@ The published site renders with the placeholder cluster parameters in [content/a
 ```
 content/           Antora content sources (modules, pages, nav)
 examples/          Supporting assets referenced by the modules
-default-site.yml   Antora playbook
+site.yaml          Antora playbook
 ui-config.yml      UI bundle configuration
 www/               Built site output (gitignored in normal use)
 ```
