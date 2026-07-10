@@ -80,7 +80,7 @@ spec:
 EOF
 ----
 
-Grant the tool's service account the cluster-wide read access it needs:
+Grant the tool's service account `cluster-admin`. Read access is enough for the assessment in this module, but the same pod runs helper scripts in Modules 3, 4, and 7 that create, patch, and delete InferenceServices, ServingRuntimes, ConfigMaps, and other cluster-scoped resources -those calls use the pod's service account token and need write:
 
 [.console-input]
 [source,role="execute"]
