@@ -31,7 +31,7 @@ oc -n redhat-ods-operator get subscription rhods-operator \
 ----
 channel=stable-2.25
 approval=Manual
-installedCSV=rhods-operator.2.25.6
+installedCSV=rhods-operator.2.25.8
 ----
 
 See which channels the catalog offers:
@@ -45,9 +45,10 @@ oc get packagemanifest rhods-operator -n openshift-marketplace \
 
 [.console-output]
 ----
-stable-3.3                 rhods-operator.3.3.3
-stable-3.x                 rhods-operator.3.4.0
-support-required-upgrade   rhods-operator.3.3.3
+stable-3.3                 rhods-operator.3.3.5
+stable-3.4                 rhods-operator.3.4.2
+stable-3.x                 rhods-operator.3.4.2
+support-required-upgrade   rhods-operator.3.3.5
 ----
 
 === Verify
@@ -98,7 +99,7 @@ channel=support-required-upgrade
 
 [IMPORTANT]
 ====
-OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.6` you'll see *one* InstallPlan (`2.25.6` to `3.3.3`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
+OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.8` you'll see *one* InstallPlan (`2.25.8` to `3.3.5`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
 ====
 
 This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
@@ -116,8 +117,8 @@ while (( $(date +%s) < deadline )); do
     sleep 30
     continue
   fi
-  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.3 -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo "rhods-operator.3.3.3 phase: ${phase:-<pending>}"
+  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.5 -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo "rhods-operator.3.3.5 phase: ${phase:-<pending>}"
   [ "$phase" = "Succeeded" ] && break
   sleep 30
 done
@@ -133,7 +134,7 @@ oc get csv -n redhat-ods-operator | grep rhods-operator
 
 [.console-output]
 ----
-rhods-operator.3.3.3   Red Hat OpenShift AI   3.3.3   rhods-operator.2.25.6   Succeeded
+rhods-operator.3.3.5   Red Hat OpenShift AI   3.3.5   rhods-operator.2.25.8   Succeeded
 ----
 
 === Verify
@@ -144,7 +145,7 @@ rhods-operator.3.3.3   Red Hat OpenShift AI   3.3.3   rhods-operator.2.25.6   Su
 oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayName=="Red Hat OpenShift AI")]}{.metadata.name} {.status.phase}{"\n"}{end}'
 ----
 
-✓ `rhods-operator.3.3.3` is `Succeeded` and no `rhods-operator.2.*` CSV remains
+✓ `rhods-operator.3.3.5` is `Succeeded` and no `rhods-operator.2.*` CSV remains
 
 == Exercise 6.4: Wait for the DSC and DSCI to settle
 
@@ -208,10 +209,10 @@ oc get subscription rhods-operator -n redhat-ods-operator \
 
 [.console-output]
 ----
-channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.3
+channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.5
 ----
 
-✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.3`
+✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.5`
 
 == Troubleshooting
 

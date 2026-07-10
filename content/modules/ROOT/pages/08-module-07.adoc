@@ -25,9 +25,9 @@ oc get dsci default-dsci -o jsonpath='DSCI: {.status.phase}{"\n"}'
 
 [.console-output]
 ----
-rhods-operator.3.3.3   Succeeded
+rhods-operator.3.3.5   Succeeded
 DSC: Ready
-DSC version: 3.3.3
+DSC version: 3.3.5
 DSCI: Ready
 ----
 
@@ -194,7 +194,7 @@ Re-run the rhai-cli lint and confirm there are zero critical findings:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 \
   | grep -E "critical|Total:|FAIL|PASS" \
   || echo "no critical findings"
 ----

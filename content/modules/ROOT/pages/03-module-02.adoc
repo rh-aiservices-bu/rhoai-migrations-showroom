@@ -30,7 +30,7 @@ oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
 
 [.console-output]
 ----
-rhods-operator.2.25.6   Succeeded
+rhods-operator.2.25.8   Succeeded
 DSC phase: Ready
 DSCI phase: Ready
 ----
@@ -70,7 +70,7 @@ spec:
     spec:
       containers:
         - name: rhai-cli
-          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.3
+          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.5
           command: ["sh","-c","sleep infinity"]
           volumeMounts:
             - { name: backup, mountPath: /tmp/rhoai-upgrade-backup }
@@ -114,7 +114,7 @@ Run the lint against the {target-version} target:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5
 ----
 
 The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | IMPACT | MESSAGE`. On this cluster you'll see both component removals *and* impacted workloads:
@@ -148,7 +148,7 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ⚠       trainingoperator        workload    impacted-workloads            warning   Found 1 active PyTorchJob(s) - uses deprecated TrainingOperator (KFTO v1)
 
 Environment:
-  OpenShift AI version: 2.25.6 -> 3.3.3
+  OpenShift AI version: 2.25.8 -> 3.3.5
   OpenShift version:    4.20.23
 
 Summary:
@@ -166,7 +166,7 @@ Save the full report for the record:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 --output yaml > rhai-cli-output.yaml
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 --output yaml > rhai-cli-output.yaml
 ----
 
 === Reading the results
@@ -190,7 +190,7 @@ Note the dependency: the `serverless-removal` and `modelmeshserving/removal` *co
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 | grep -iE 'critical|warning'
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 | grep -iE 'critical|warning'
 ----
 
 ✓ You can see the nine critical (`✗`) findings and the ten warning (`⚠`) findings

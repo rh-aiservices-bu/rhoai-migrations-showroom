@@ -11,7 +11,7 @@ asciidoc:
     release-version: master
     page-pagination: '@'
     source-version: "2.25"
-    target-version: "3.3.3"
+    target-version: "3.3.5"
     migration-channel: "support-required-upgrade"
     stable-channel: "stable-3.3"
     # Custom workbench images used in Module 4. Build + push instructions are in

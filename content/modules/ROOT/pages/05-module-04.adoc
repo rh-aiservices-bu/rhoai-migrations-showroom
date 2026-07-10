@@ -403,7 +403,7 @@ Re-run the lint and confirm zero critical findings:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.3 \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 \
   | grep -E 'Total:|FAIL|PASS'
 ----
 
