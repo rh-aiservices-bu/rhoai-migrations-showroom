@@ -379,6 +379,10 @@ oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."servi
 
 *Solution*: Delete the ModelMesh ISVC first (Exercise 3.5). The runtime can only be removed once no ISVC references it.
 
+*Issue*: `oc delete isvc` on a leftover Serverless ISVC hangs forever -it stays in `Terminating` and the delete never returns.
+
+*Solution*: This is a finalizer deadlock, and it's exactly why this module converts (and deletes) every Serverless ISVC *before* Module 4 removes Serverless and Service Mesh. A Serverless ISVC carries a KServe finalizer whose cleanup deletes the Knative `Service` and Istio `VirtualService` it owns. If those components are already gone, the finalizer can't reach their APIs, errors out, and never clears -so the object is stuck. Recovery: if the operators are still installed, re-enable Serverless/Service Mesh, let the delete finish, then remove them in the right order. If they're already uninstalled, force-clear the finalizer and recreate the model as RawDeployment: `oc patch isvc <name> -n <ns> --type=merge -p '{"metadata":{"finalizers":null}}'` (this skips the real cleanup, so sweep for orphaned `ksvc`/`virtualservice` afterward). The rule: never disable a component while a workload still depends on it.
+
 == Learning outcomes
 
 You've completed the conversion phase. You can:
