@@ -137,6 +137,20 @@ oc get csv -n redhat-ods-operator | grep rhods-operator
 rhods-operator.3.3.5   Red Hat OpenShift AI   3.3.5   rhods-operator.2.25.8   Succeeded
 ----
 
+[WARNING]
+====
+*Do not approve the Service Mesh Operator 3 upgrade to 3.4.0.* Once RHOAI {target-version} is installed, OLM parks a separate "upgrade available" InstallPlan in front of the `servicemeshoperator3` subscription. This is a *different operator* from the `rhods-operator` InstallPlans you just approved — the loop above only touches `redhat-ods-operator`.
+
+On OCP 4.19–4.21 the cluster-ingress-operator hardcodes the Gateway API Istio version to `v1.26.2`, and OSSM 3.4.0 rejects that version as end-of-life. Approving it leaves `openshift-gateway` in a permanent `ReconcileError` with *no supported downgrade*. Keep the Service Mesh Operator on `installPlanApproval: Manual` and pin it ≤ 3.3.x until link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^] ship a fix. Confirm no 3.4.0 InstallPlan is auto-approved:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get installplan -n openshift-operators \
+  -o custom-columns='NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved' | grep servicemeshoperator3 || echo "no OSSM3 InstallPlan pending"
+----
+====
+
 === Verify
 
 [.console-input]

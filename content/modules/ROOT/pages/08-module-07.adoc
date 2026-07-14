@@ -229,6 +229,10 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 
 *Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST is rejected: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
 
+*Issue*: `openshift-gateway` is in `ReconcileError` with `validation error: version "v1.26.2" is end-of-life and cannot be installed`.
+
+*Solution*: The Service Mesh Operator 3 was upgraded to 3.4.0, which rejects the `v1.26.2` Istio version that OCP 4.19–4.21's ingress operator hardcodes for the Gateway API. Editing the version by hand is reverted within seconds. There is no supported OSSM downgrade — prevention is the only clean path, so this InstallPlan should never have been approved (see the WARNING in Module 6, Exercise 6.3). A cluster already on OSSM 3.4.0 is a restore-from-backup case; do not attempt informal downgrade workarounds. Track link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^].
+
 *Issue*: `workbench-2.x-to-3.x-upgrade.sh list --all` reports `Failed: N`.
 
 *Solution*: Inspect each with `oc describe notebook <name> -n <ns>`. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
