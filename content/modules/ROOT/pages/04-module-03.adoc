@@ -51,7 +51,7 @@ oc exec -n rhai-migration rhai-cli-0 -it -- \
   --dry-run -n ml-project-a
 ----
 
-The script discovers the namespace's Serverless ISVCs and stops at *two* interactive prompts. Step through them:
+The script discovers the namespace's Serverless ISVCs and stops at interactive prompts. In `--dry-run` mode there are *two*; with `--delete-existing` (the destructive apply below) there is a *third* confirmation prompt. Step through the first two:
 
 [.console-output]
 ----
@@ -87,7 +87,15 @@ oc exec -n rhai-migration rhai-cli-0 -it -- \
   --delete-existing -n ml-project-a
 ----
 
-Answer the same two prompts (`all`, then `1`). The script deletes the legacy resources and applies the RawDeployment-shaped replacements with the original names.
+Answer the same first two prompts (`all`, then `1`). `--delete-existing` then adds a *third* prompt:
+
+[.console-output]
+----
+⚠️  WARNING: IN-PLACE REPLACEMENT MODE
+Please enter 'yes' or 'no':
+----
+
+Type `yes` and press Enter. The script deletes the legacy resources and applies the RawDeployment-shaped replacements with the original names. (Anything other than `yes` here aborts.)
 
 === Verify
 
@@ -109,7 +117,7 @@ my-serverless-isvc   RawDeployment    True
 
 == Exercise 3.3: Convert the second Serverless ISVC
 
-Repeat the same helper + the same two interactive answers (`all`, then `1` for in-place / original names) for `ml-project-b`:
+Repeat the same helper for `ml-project-b` — same answers as Exercise 3.2 (`all`, then `1`; on the `--delete-existing` apply, `all`, `1`, `yes`):
 
 [.console-input]
 [source,role="execute"]
@@ -129,7 +137,7 @@ oc exec -n rhai-migration rhai-cli-0 -it -- \
   --delete-existing -n ml-project-b
 ----
 
-Answer `all` then `1` at the prompts as before.
+Answer `all`, `1`, `yes` at the three prompts as before.
 
 === Verify
 
@@ -224,7 +232,7 @@ For the lab, the new RawDeployment ISVC lives in the *same* namespace as the Mod
 
 [NOTE]
 ====
-For in-place migration there's no dry-run preview — the script is destructive by design. The two interactive prompts are the safety net: it asks which ISVCs to migrate and which runtime template to use *before* applying anything, so you can `q` out if the choices look wrong. If you want to inspect the generated YAML before any cluster changes, dry-run against a throwaway target namespace first (see *Optional preview* below).
+For in-place migration there's no dry-run preview — the script is destructive by design. The interactive prompts are the safety net: it asks for a destructive confirmation up front, then which ISVCs to migrate, which runtime template, and what to do with the storage config *before* applying anything, so you can `q` out (or answer `no`) if the choices look wrong. If you want to inspect the generated YAML before any cluster changes, dry-run against a throwaway target namespace first (see *Optional preview* below).
 ====
 
 Run the in-place migration:
@@ -237,10 +245,12 @@ oc exec -n rhai-migration rhai-cli-0 -it -- \
   --from-ns ml-project-c --preserve-namespace
 ----
 
-Step through the interactive prompts:
+Step through the four interactive prompts:
 
-1. *Selection prompt* — answer `all` to select every ModelMesh ISVC.
-2. *Runtime-template prompt* — the script lists every ServingRuntime template available in the cluster. Press `d` to accept the default, `kserve-ovms` (KServe single-model OpenVINO Model Server). Don't pick `[6] ovms` -that's the multi-model variant you're migrating away from. `kserve-ovms` reads the same `mobilenet/1/model.onnx` from the same PVC, so no model conversion happens.
+1. *Destructive-mode confirmation* — the script prints a `⚠️ DESTRUCTIVE OPERATION WARNING` banner and asks `Do you understand the risks and want to continue? (type 'yes' to proceed):`. Type `yes`. Anything else aborts with `👋 Migration cancelled for safety.`
+2. *Selection prompt* — answer `all` to select every ModelMesh ISVC.
+3. *Runtime-template prompt* — the script lists every ServingRuntime template available in the cluster. Press `d` to accept the default, `kserve-ovms` (KServe single-model OpenVINO Model Server). Don't pick `[6] ovms` -that's the multi-model variant you're migrating away from. `kserve-ovms` reads the same `mobilenet/1/model.onnx` from the same PVC, so no model conversion happens.
+4. *Storage-configuration prompt* — the script detects the OpenVINO-style storage and asks whether to update it. Type `1` to *keep current configuration*. (The script transcribes the ModelMesh storage block as-is; you'll fix the resulting webhook error with a small patch after Verify below.)
 
 [NOTE]
 ====

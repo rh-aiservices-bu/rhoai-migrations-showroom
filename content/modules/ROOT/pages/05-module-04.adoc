@@ -23,6 +23,16 @@ By the end of this module, you'll be able to:
 
 The `codeflare` operator is removed in 3.x; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields. Run this *before* Exercise 4.7 — the helper requires CodeFlare to still be installed.
 
+[IMPORTANT]
+====
+Despite the name, `ray_cluster_migration.py pre-upgrade` does more than back up. It *also*:
+
+* Patches the DSC to set `codeflare.managementState=Removed` (the same flip Exercise 4.7 makes).
+* Deletes the CodeFlare-owned `ray-dashboard-*` and `rayclient-*` OpenShift Routes owned by each RayCluster.
+
+Both are prerequisites for KubeRay to take over cleanly. RayCluster pods keep serving throughout. Exercise 4.7 is still safe to run — the DSC patch is a no-op there because the field is already `Removed`.
+====
+
 [.console-input]
 [source,role="execute"]
 ----
@@ -366,17 +376,22 @@ OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies
 [.console-input]
 [source,role="execute"]
 ----
+# Delete the sub + one copy of the cluster-wide CSV (OLM removes the rest automatically).
+# NOTE: OLM copies each CSV into every namespace; deleting one copy triggers cluster-wide
+# removal, so we filter to a single row per operator with `sort -u`. Running the
+# `xargs -L1` form instead prints one NotFound per copied namespace — harmless but noisy.
+
 # Standalone Authorino
 oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
 
 # OpenShift Serverless
 oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
 
 # Service Mesh 2 (safe now that the SMCP and SMMR are gone)
 oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | xargs -L1 oc delete csv
+oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
 ----
 
 === Verify

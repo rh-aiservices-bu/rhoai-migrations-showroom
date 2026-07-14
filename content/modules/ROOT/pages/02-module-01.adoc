@@ -47,8 +47,16 @@ The same probing logic Module 8 uses post-upgrade: discover the served model ID 
 for isvc in $(oc get isvc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
   NS="${isvc%/*}"; NAME="${isvc##*/}"
   URL=$(oc get isvc "$NAME" -n "$NS" -o jsonpath='{.status.url}')
-  POD_STATE=$(oc get pods -n "$NS" -l serving.kserve.io/inferenceservice="$NAME" \
-    -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+  MODE=$(oc get isvc "$NAME" -n "$NS" -o jsonpath='{.metadata.annotations.serving\.kserve\.io/deploymentMode}')
+  # ModelMesh pods don't carry the KServe inferenceservice label; the runtime pod is the workload.
+  if [ "$MODE" = "ModelMesh" ]; then
+    RUNTIME=$(oc get isvc "$NAME" -n "$NS" -o jsonpath='{.spec.predictor.model.runtime}')
+    POD_STATE=$(oc get pods -n "$NS" -l "name=modelmesh-serving-$RUNTIME" \
+      -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+  else
+    POD_STATE=$(oc get pods -n "$NS" -l serving.kserve.io/inferenceservice="$NAME" \
+      -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+  fi
   echo "--- $isvc ---"
   echo "  URL:           $URL"
   echo "  Predictor pod: ${POD_STATE:-no pod}"

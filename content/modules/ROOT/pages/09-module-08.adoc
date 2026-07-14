@@ -74,12 +74,12 @@ oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 == Exercise 8.2: Reach each workbench through the Gateway
 
-3.x workbenches sit behind the Gateway API at `https://<gateway-host>/notebook/<ns>/<name>/`. Curl each one (you don't need to log in — a 2xx or 3xx status confirms the route + kube-rbac-proxy are working):
+3.x workbenches sit behind the Gateway API at `https://<gateway-host>/notebook/<ns>/<name>/`. On `ingressMode: OcpRoute` installs (the default), the gateway is exposed through the `data-science-gateway` OpenShift Route in `openshift-ingress`. Read the host from that Route and curl each workbench (you don't need to log in — a 2xx or 3xx status confirms the route + kube-rbac-proxy are working):
 
 [.console-input]
 [source,role="execute"]
 ----
-GATEWAY_HOST=$(oc get gatewayconfig default-gateway -o jsonpath='{.spec.hostname}')
+GATEWAY_HOST=$(oc get route data-science-gateway -n openshift-ingress -o jsonpath='{.spec.host}')
 for nb in $(oc get notebook -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
   NS="${nb%/*}"; NAME="${nb##*/}"
   URL="https://${GATEWAY_HOST}/notebook/${NS}/${NAME}/"

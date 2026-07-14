@@ -188,23 +188,36 @@ oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 == Exercise 7.7: Final assessment
 
-Re-run the rhai-cli lint and confirm there are zero critical findings:
+Re-run the rhai-cli lint to confirm the tool sees a healthy cluster on {target-version}. When the current version already equals the target, `rhai-cli lint` short-circuits with a "no checks will be executed" line -that itself is the pass signal: nothing left to lint.
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 \
-  | grep -E "critical|Total:|FAIL|PASS" \
-  || echo "no critical findings"
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 2>&1 \
+  | tail -5
 ----
 
 [.console-output]
 ----
-  Total: 38 | Passed: 30 | Warnings: 8 | Failed: 0 | Prohibited: 0
+Environment:
+  OpenShift AI version: 3.3.5
+  OpenShift version:    4.20.27
+
+Current and target versions are the same (3.3), no checks will be executed.
 ----
 
-✓ `Failed: 0` -the migration is clean on {target-version}
+✓ `Current and target versions are the same` -the migration is on {target-version} and there is nothing left for the lint to check
+
+To gauge readiness for the *next* upgrade (3.3 → 3.4), point `--target-version` at 3.4 instead. That's optional -it's a preview of the next migration, not a check on this one:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.4 \
+  | grep -E "Total:|Result:"
+----
 
 == Troubleshooting
 
