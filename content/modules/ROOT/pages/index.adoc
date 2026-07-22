@@ -61,6 +61,38 @@ oc auth can-i '*' '*' --all-namespaces
 
 You should see your username and `yes`. If the auth check returns `no`, log out and log back in with a cluster-admin account before continuing.
 
+== Disable ArgoCD auto-sync
+
+[IMPORTANT]
+====
+*You cannot proceed with the workshop until this step is complete.*
+
+The lab environment is bootstrapped with OpenShift GitOps (ArgoCD). Every `Application` ships with `syncPolicy.automated.selfHeal: true`, meaning ArgoCD will *revert* any change you make on the cluster back to what its Git source says within seconds. If you skip this step, ArgoCD will undo every subscription patch, DSC edit, ISVC conversion, ConfigMap change, and operator uninstall you perform in the following modules -often before you finish reading the verify block.
+
+Disable auto-sync on every ArgoCD Application before touching anything else. Manual sync from the ArgoCD UI still works if you ever need it, but nothing will happen unattended.
+====
+
+[.console-input]
+[source,role="execute"]
+----
+oc get applications.argoproj.io -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name}{"\n"}{end}' | \
+  while read -r NS NAME; do
+    oc -n "$NS" patch application.argoproj.io "$NAME" --type=merge \
+      -p='{"spec":{"syncPolicy":{"automated":null}}}'
+  done
+----
+
+=== Verify
+
+Every row must show `<none>` in the `AUTOMATED` column. If any row still shows a policy, re-run the disable loop before continuing:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get applications.argoproj.io -A \
+  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,AUTOMATED:.spec.syncPolicy.automated'
+----
+
 == The starting cluster
 
 Your lab cluster was provisioned with OpenShift AI {source-version} in a realistic, messy pre-migration state. The DSC is `Ready` and the cluster is healthy -but it carries workloads that the 3.x removals would break:
