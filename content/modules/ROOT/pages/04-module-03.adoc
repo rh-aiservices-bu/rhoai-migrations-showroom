@@ -167,22 +167,25 @@ Inspect the ModelMesh ISVC and its multi-model runtime:
 [.console-input]
 [source,role="execute"]
 ----
-oc get isvc my-modelmesh-isvc -n ml-project-c -o yaml | yq '.spec'
+oc get isvc my-modelmesh-isvc -n ml-project-c -o json \
+  | jq '.spec.predictor.model | {modelFormat, runtime, storage}'
 echo "--- multi-model ServingRuntime ---"
 oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='multiModel={.spec.multiModel}{"\n"}'
 ----
 
 [.console-output]
 ----
-predictor:
-  model:
-    modelFormat:
-      name: onnx
-      version: "1"
-    runtime: ovms-mm
-    storage:
-      key: pvc-models
-      path: mobilenet
+{
+  "modelFormat": {
+    "name": "onnx",
+    "version": "1"
+  },
+  "runtime": "ovms-mm",
+  "storage": {
+    "key": "pvc-models",
+    "path": "mobilenet"
+  }
+}
 --- multi-model ServingRuntime ---
 multiModel=true
 ----
