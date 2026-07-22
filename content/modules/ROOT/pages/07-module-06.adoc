@@ -31,7 +31,7 @@ oc -n redhat-ods-operator get subscription rhods-operator \
 ----
 channel=stable-2.25
 approval=Manual
-installedCSV=rhods-operator.2.25.8
+installedCSV=rhods-operator.2.25.9
 ----
 
 See which channels the catalog offers:
@@ -99,7 +99,7 @@ channel=support-required-upgrade
 
 [IMPORTANT]
 ====
-OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.8` you'll see *one* InstallPlan (`2.25.8` to `3.3.5`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
+OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.9` you'll see *one* InstallPlan (`2.25.9` to `3.3.5`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
 ====
 
 This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
@@ -134,7 +134,7 @@ oc get csv -n redhat-ods-operator | grep rhods-operator
 
 [.console-output]
 ----
-rhods-operator.3.3.5   Red Hat OpenShift AI   3.3.5   rhods-operator.2.25.8   Succeeded
+rhods-operator.3.3.5   Red Hat OpenShift AI   3.3.5   rhods-operator.2.25.9   Succeeded
 ----
 
 [WARNING]

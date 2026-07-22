@@ -30,7 +30,7 @@ oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
 
 [.console-output]
 ----
-rhods-operator.2.25.8   Succeeded
+rhods-operator.2.25.9   Succeeded
 DSC phase: Ready
 DSCI phase: Ready
 ----
@@ -122,15 +122,15 @@ The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | I
 [.console-output]
 ----
 STATUS  KIND                    GROUP       CHECK                         IMPACT    MESSAGE
-✓       cert-manager            dependency  installed                     info      cert-manager Operator for Red Hat OpenShift installed: cert-manager-operator.v1.19.0
-✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.20.23 meets RHOAI 3.3 minimum version requirement (4.19.9+)
-✓       servicemesh-v3          dependency  installed                     info      Red Hat Service Mesh v3 (servicemeshoperator3.v3.1.0) is available in the 'stable' channel
+✓       cert-manager            dependency  installed                     info      cert-manager Operator for Red Hat OpenShift installed: cert-manager-operator.v1.20.0
+✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.21.24 meets RHOAI 3.3 minimum version requirement (4.19.9+)
+✓       servicemesh-v3          dependency  installed                     info      Red Hat Service Mesh v3 (servicemeshoperator3.v3.2.0) is available in the 'stable' channel
 ✓       dsc                     platform    readiness                     info      DataScienceCluster is ready
 ✓       dsci                    platform    readiness                     info      DSCInitialization is ready
 ⚠       datasciencepipelines    component   renaming                      warning   DataSciencePipelines component will be renamed to AIPipelines in DSC v2 (RHOAI 3.3)
 ✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.3
 ✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.3
-⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.16) is installed but no longer required
+⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.17) is installed but no longer required
 ✗       kueue                   component   management-state              critical  Kueue managementState is Managed but the 3.3 upgrade only supports Removed. No workloads use Kueue.
 ✗       modelmeshserving        component   removal                       critical  ModelMesh Serving is enabled (state: Managed) but will be removed in RHOAI 3.3
 ✗       ray                     component   removal                       critical  CodeFlare is enabled (state: Managed) but will be removed in RHOAI 3.3
@@ -148,8 +148,8 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ⚠       trainingoperator        workload    impacted-workloads            warning   Found 1 active PyTorchJob(s) - uses deprecated TrainingOperator (KFTO v1)
 
 Environment:
-  OpenShift AI version: 2.25.8 -> 3.3.5
-  OpenShift version:    4.20.23
+  OpenShift AI version: 2.25.9 -> 3.3.5
+  OpenShift version:    4.21.24
 
 Summary:
   Total: 40 | Passed: 21 | Warnings: 10 | Failed: 9 | Prohibited: 0

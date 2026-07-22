@@ -202,7 +202,7 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 ----
 Environment:
   OpenShift AI version: 3.3.5
-  OpenShift version:    4.20.27
+  OpenShift version:    4.21.24
 
 Current and target versions are the same (3.3), no checks will be executed.
 ----
