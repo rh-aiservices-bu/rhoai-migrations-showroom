@@ -376,22 +376,23 @@ OpenShift Serverless, Service Mesh 2, and standalone Authorino were dependencies
 [.console-input]
 [source,role="execute"]
 ----
-# Delete the sub + one copy of the cluster-wide CSV (OLM removes the rest automatically).
-# NOTE: OLM copies each CSV into every namespace; deleting one copy triggers cluster-wide
-# removal, so we filter to a single row per operator with `sort -u`. Running the
-# `xargs -L1` form instead prints one NotFound per copied namespace — harmless but noisy.
+# Delete the Subscription first, then the *source* CSV in the operator's install
+# namespace. OLM auto-cleans the copies of a CSV that appear in every other
+# namespace once the source is gone. Selecting by OLM's per-namespace label
+# targets only the source, not any of the copies (deleting a copy just makes
+# OLM re-sync it, leaving the operator installed).
 
-# Standalone Authorino
+# Standalone Authorino (installed in openshift-operators)
 oc -n openshift-operators delete subscription authorino-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/authorino-operator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
+oc -n openshift-operators delete csv -l operators.coreos.com/authorino-operator.openshift-operators --ignore-not-found
 
-# OpenShift Serverless
+# OpenShift Serverless (installed in openshift-serverless)
 oc -n openshift-serverless delete subscription serverless-operator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/serverless-operator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
+oc -n openshift-serverless delete csv -l operators.coreos.com/serverless-operator.openshift-serverless --ignore-not-found
 
-# Service Mesh 2 (safe now that the SMCP and SMMR are gone)
+# Service Mesh 2 (installed in openshift-operators; safe now that the SMCP and SMMR are gone)
 oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-found
-oc get csv -A 2>/dev/null | awk '/servicemeshoperator\./ {print "-n "$1, $2}' | sort -u -k3,3 | xargs -L1 oc delete csv
+oc -n openshift-operators delete csv -l operators.coreos.com/servicemeshoperator.openshift-operators --ignore-not-found
 ----
 
 === Verify
