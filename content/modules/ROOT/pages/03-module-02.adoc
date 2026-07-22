@@ -137,9 +137,9 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ⚠       trainingoperator        component   deprecation                   warning   TrainingOperator (KFTO v1) is deprecated; will be replaced by Trainer v2 in a future release
 ⚠       guardrails              workload    config-migration              warning   Found 1 GuardrailsOrchestrator(s) using deprecated otelExporter fields - migrate before upgrade
 ⚠       guardrails              workload    impacted-workloads            warning   Found 1 misconfigured GuardrailsOrchestrator(s)
+✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh ServingRuntime(s) - will be impacted in RHOAI 3.3
 ✗       kserve                  workload    impacted-workloads            critical  Found 2 Serverless InferenceService(s) - will be impacted in RHOAI 3.3
 ✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh InferenceService(s) - will be impacted in RHOAI 3.3
-✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh ServingRuntime(s) - will be impacted in RHOAI 3.3
 ⚠       kserve                  workload    impacted-workloads            warning   inferenceservice-config ConfigMap must have opendatahub.io/managed=false and include hardware-profile annotations
 ✗       llamastackdistribution  workload    config                        critical  Found 1 LlamaStackDistribution(s) that must be deleted and recreated. ALL DATA WILL BE LOST.
 ⚠       notebook                workload    impacted-workloads            warning   Found 4 Notebook(s) using 3 unique images: 2 compatible, 1 custom (verification), 1 incompatible (update)
