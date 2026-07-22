@@ -18,6 +18,17 @@ asciidoc:
     # examples/README.md.
     legacy-workbench-image: "quay.io/hayesphilip/rhoai-workbench-2x:lab-4.2.5"
     gw-workbench-image:     "quay.io/hayesphilip/rhoai-workbench-gw:3.x"
+    # Cluster access details. Defaults below are example placeholders; the RHDP
+    # catalog item overrides them per-user by merging its user_data.yml into
+    # this file at pod start (see the showroom-content image's entrypoint).
+    openshift_cluster_admin_username: "admin"
+    openshift_cluster_admin_password: "<lab-provided>"
+    openshift_api_server_url:         "https://api.cluster-example.dyn.redhatworkshops.io:6443"
+    openshift_cluster_console_url:    "https://console-openshift-console.apps.cluster-example.dyn.redhatworkshops.io"
+    openshift_gitops_server:          "https://openshift-gitops-server-openshift-gitops.apps.cluster-example.dyn.redhatworkshops.io"
+    keycloak_admin_console:           "https://sso.apps.cluster-example.dyn.redhatworkshops.io"
+    keycloak_admin_user:              "temp-admin"
+    keycloak_admin_password:          "<lab-provided>"
     page-links:
     - url: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3
       text: RHOAI 3.3 docs

@@ -23,14 +23,31 @@ This workshop assumes you already have:
 * Backup and restore (a real migration requires a verified backup first; that is out of scope here)
 * Rolling back a failed migration
 
+== Access details
+
+Your lab environment provisioned the following endpoints and credentials. The workshop only requires the cluster-admin login (below); the other URLs are here for reference in case you want to poke around the OpenShift console, ArgoCD, or Keycloak while you work.
+
+[cols="1,3",options="header"]
+|===
+| Resource | Value
+| OpenShift API server | {openshift_api_server_url}
+| OpenShift console | {openshift_cluster_console_url}
+| OpenShift admin user | `{openshift_cluster_admin_username}`
+| OpenShift admin password | `{openshift_cluster_admin_password}`
+| ArgoCD (OpenShift GitOps) | {openshift_gitops_server}
+| Keycloak admin console | {keycloak_admin_console}
+| Keycloak admin user | `{keycloak_admin_user}`
+| Keycloak admin password | `{keycloak_admin_password}`
+|===
+
 == Log in to the cluster
 
-Every command in this workshop runs from the terminal. Log in to the cluster as `cluster-admin` using the API server URL and credentials supplied by your lab environment:
+Every command in this workshop runs from the terminal. Log in as `cluster-admin`:
 
 [.console-input]
-[source,role="execute"]
+[source,role="execute",subs="attributes+"]
 ----
-oc login -u <admin-user> -p <admin-password> <api-server-url>
+oc login -u {openshift_cluster_admin_username} -p {openshift_cluster_admin_password} {openshift_api_server_url}
 ----
 
 Confirm the session has `cluster-admin` privileges:
