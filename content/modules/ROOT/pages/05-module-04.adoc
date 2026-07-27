@@ -16,7 +16,7 @@ By the end of this module, you'll be able to:
 * Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs ahead of destructive component changes, and delete any LlamaStackDistributions
 * Update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist
 * Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`
-* Remove the Service Mesh v2 dependency including the lingering member roll
+* Remove the Service Mesh v2 dependency including the lingering member roll and leftover Istio CRDs
 * Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
 
 == Exercise 4.1: Back up the RayClusters
@@ -395,21 +395,31 @@ oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-f
 oc -n openshift-operators delete csv -l operators.coreos.com/servicemeshoperator.openshift-operators --ignore-not-found
 ----
 
+Finally, delete the Istio CRDs that Service Mesh v2 leaves behind. Uninstalling an operator *never* removes its CRDs, and these leftovers -all labelled `maistra-version` (`heritage: Tiller`, `helm.sh/resource-policy: keep`) -will silently break the 3.x OpenShift Gateway API after the upgrade. The cluster-ingress-operator refuses to install its own `networking.istio.io/v1` Istio CRDs while CRDs it doesn't own already exist (it reports them as `UnknownManagement`), so the `data-science-gateway` never programs and the dashboard URL is unreachable. They are safe to delete now: the SMCP and SMMR are already gone, so no objects reference them.
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete crd -l maistra-version --ignore-not-found
+----
+
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
 oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
+echo "Maistra CRDs remaining: $(oc get crd -l maistra-version --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 echo "--- check complete ---"
 ----
 
 [.console-output]
 ----
+Maistra CRDs remaining: 0
 --- check complete ---
 ----
 
-✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain, and no `maistra-version`-labelled Istio CRDs are left to block the Gateway API
 
 == Exercise 4.12: Re-run the assessment
 
@@ -445,7 +455,7 @@ You've completed the platform remediation. You can:
 
 * [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
 * [x] Flip every removed component to `Removed` in the correct order
-* [x] Remove the Service Mesh v2 dependency including the lingering member roll
+* [x] Remove the Service Mesh v2 dependency including the lingering member roll and leftover Istio CRDs
 * [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary

@@ -229,6 +229,19 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 
 *Solution*: On clusters with an SRE-managed admission webhook restricting NetworkPolicy creation in `openshift-*` namespaces, the GatewayConfig reconciler's NetworkPolicy POST is rejected: `oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"networkPolicy":{"ingress":{"enabled":false}}}}'`.
 
+*Issue*: The dashboard URL is unreachable and the `data-science-gateway` Gateway shows `PROGRAMMED=False`. `oc get gateway data-science-gateway -n openshift-ingress` reports `AddressNotUsable`, `oc get gatewayconfig default-gateway` is `Ready=False` with `no matches for kind "DestinationRule" in version networking.istio.io/v1`, and `oc get gatewayclass data-science-gateway-class -o yaml` shows `CRDsReady=False / UnknownManagement`.
+
+*Solution*: The Service Mesh v2 (Maistra 2.6) Istio CRDs were never removed during the teardown, so they survived the operator uninstall. They only serve `v1alpha3`/`v1beta1`, and because they carry foreign ownership labels the cluster-ingress-operator refuses to replace them with its own `networking.istio.io/v1` CRDs -leaving the Gateway unprogrammed and the dashboard offline. This should have been cleaned up in Module 4, Exercise 4.11 (`oc delete crd -l maistra-version`). To recover now (safe: these CRDs hold no objects once Service Mesh v2 is gone -confirm with `oc get crd -l maistra-version -o name | sed 's|.*/||' | xargs -I{} sh -c 'oc get {} -A --no-headers 2>/dev/null | wc -l'`):
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete crd -l maistra-version --ignore-not-found
+oc rollout restart deploy/ingress-operator -n openshift-ingress-operator
+----
+
+The ingress operator then installs the `v1` Istio CRDs (labelled `ingress.operator.openshift.io/owned=true`), `GatewayClass` flips to `CRDsReady=True / ManagedByCIO`, istiod becomes `1/1`, the GatewayConfig creates the `data-science-tls-rule` DestinationRule and the gateway TLS secret, and the Gateway programs. The dashboard URL then returns `302` to the OAuth login.
+
 *Issue*: `openshift-gateway` is in `ReconcileError` with `validation error: version "v1.26.2" is end-of-life and cannot be installed`.
 
 *Solution*: The Service Mesh Operator 3 was upgraded to 3.4.0, which rejects the `v1.26.2` Istio version that OCP 4.19–4.21's ingress operator hardcodes for the Gateway API. Editing the version by hand is reverted within seconds. There is no supported OSSM downgrade — prevention is the only clean path, so this InstallPlan should never have been approved (see the WARNING in Module 6, Exercise 6.3). A cluster already on OSSM 3.4.0 is a restore-from-backup case; do not attempt informal downgrade workarounds. Track link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^].

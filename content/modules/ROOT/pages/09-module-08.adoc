@@ -3,7 +3,7 @@
 :toc: macro
 :toclevels: 2
 
-Module 7 confirmed the platform is healthy. This module confirms the *workloads* still work for users. Four quick tests: hit each model, reach each workbench, list pipelines through the DSPA, confirm Ray clusters accept work.
+Module 7 confirmed the platform is healthy. This module confirms the *workloads* still work for users. Five quick tests: open the dashboard, hit each model, reach each workbench, list pipelines through the DSPA, confirm Ray clusters accept work.
 
 These are smoke tests -they answer "does this thing serve a request?" Not "does it produce identical bytes to pre-upgrade?" If you want before/after evidence, Module 1 captured a pre-upgrade snapshot you can diff against; this module doesn't require it.
 
@@ -11,12 +11,46 @@ These are smoke tests -they answer "does this thing serve a request?" Not "does 
 
 By the end of this module, you'll be able to:
 
+* Open the RHOAI dashboard through its new Gateway URL
 * Send an inference request to each migrated ISVC and confirm a sensible response
 * Reach each workbench through its new Gateway URL
 * Confirm the AI Pipelines DSPA serves the pipelines API
 * Confirm every Ray cluster is `ready`
 
-== Exercise 8.1: Inference test each model
+== Exercise 8.1: Confirm the dashboard is reachable
+
+The dashboard is the front door to everything else in this module. In 3.x it's served through the Gateway API instead of an OpenShift Route, so reaching it also proves the `data-science-gateway` is programmed and its Istio wiring survived the Service Mesh v2 teardown in Module 4. Read the gateway host and curl the dashboard root -an unauthenticated request should redirect to the OAuth/SSO login, which is what a healthy dashboard returns (you don't need to log in):
+
+[.console-input]
+[source,role="execute"]
+----
+GATEWAY_HOST=$(oc get route data-science-gateway -n openshift-ingress -o jsonpath='{.spec.host}')
+echo "Dashboard URL: https://${GATEWAY_HOST}/"
+curl -sk -o /dev/null -w 'HTTP %{http_code}\n' --max-time 15 "https://${GATEWAY_HOST}/"
+----
+
+Expect `HTTP 302` or `303` (redirect to the OAuth/SSO login), or `HTTP 200`. A `000` (connection refused) or `503` means the gateway isn't serving -see Troubleshooting.
+
+=== Verify
+
+The curl proves the front door answers; this confirms the platform itself agrees the dashboard is healthy. Both the DSC `DashboardReady` condition and the Gateway `Programmed` condition must be `True`:
+
+[.console-input]
+[source,role="execute"]
+----
+echo "DashboardReady:     $(oc get dsc default-dsc -o jsonpath='{range .status.conditions[?(@.type=="DashboardReady")]}{.status}{end}')"
+echo "Gateway Programmed: $(oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{range .status.conditions[?(@.type=="Programmed")]}{.status}{end}')"
+----
+
+[.console-output]
+----
+DashboardReady:     True
+Gateway Programmed: True
+----
+
+✓ The dashboard is reachable through the Gateway, with both `DashboardReady` and the Gateway `Programmed` conditions `True`
+
+== Exercise 8.2: Inference test each model
 
 Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test.
 
@@ -72,7 +106,7 @@ oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 ✓ All four ISVCs report `Ready=True` and respond to inference
 
-== Exercise 8.2: Reach each workbench through the Gateway
+== Exercise 8.3: Reach each workbench through the Gateway
 
 3.x workbenches sit behind the Gateway API at `https://<gateway-host>/notebook/<ns>/<name>/`. On `ingressMode: OcpRoute` installs (the default), the gateway is exposed through the `data-science-gateway` OpenShift Route in `openshift-ingress`. Read the host from that Route and curl each workbench (you don't need to log in — a 2xx or 3xx status confirms the route + kube-rbac-proxy are working):
 
@@ -103,7 +137,7 @@ oc exec -n rhai-migration rhai-cli-0 -- bash -c '
 
 ✓ `Legacy (2.x): 0` and all workbenches show as migrated
 
-== Exercise 8.3: Confirm the DSPA serves the pipelines API
+== Exercise 8.4: Confirm the DSPA serves the pipelines API
 
 The DSPA is reconciled by the same `datasciencepipelines` component as pre-upgrade. Hit the API root + list pipelines:
 
@@ -133,7 +167,7 @@ oc get dspa -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 ✓ The DSPA reports `Ready=True`
 
-== Exercise 8.4: Confirm Ray clusters accept work
+== Exercise 8.5: Confirm Ray clusters accept work
 
 Module 7 Exercise 7.4 ran the KubeRay migration script. Confirm each cluster is still `ready` and reports its worker count:
 
@@ -162,6 +196,10 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 == Troubleshooting
 
+*Issue*: The dashboard URL returns `000` or `503`, or the `data-science-gateway` Gateway shows `PROGRAMMED=False`.
+
+*Solution*: The Gateway API isn't serving. The most common cause on an upgraded cluster is leftover Service Mesh v2 (Maistra) Istio CRDs that were never removed in Module 4 -they block the cluster-ingress-operator from installing its own `v1` Istio CRDs, so the gateway never programs. See Module 7's Troubleshooting entry "The dashboard URL is unreachable and the `data-science-gateway` Gateway shows `PROGRAMMED=False`" for the full diagnosis and recovery (`oc delete crd -l maistra-version` then restart the ingress operator).
+
 *Issue*: An LLM inference returns 502 or 503.
 
 *Solution*: Give the predictor pod a minute -the 3.x kserve controller may still be rolling it onto the newer runtime image. Re-run after 60 seconds. If it persists, check the predictor pod logs.
@@ -182,6 +220,7 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 You've validated the user-visible workloads on the new platform. You can:
 
+* [x] Open the RHOAI dashboard through the new Gateway URL
 * [x] Send an inference request to each migrated ISVC and confirm a sensible response
 * [x] Reach each workbench through the new Gateway URL
 * [x] Confirm the AI Pipelines DSPA serves the pipelines API
