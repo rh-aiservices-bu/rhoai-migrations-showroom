@@ -61,6 +61,69 @@ oc auth can-i '*' '*' --all-namespaces
 
 You should see your username and `yes`. If the auth check returns `no`, log out and log back in with a cluster-admin account before continuing.
 
+== Wait for the cluster to finish provisioning
+
+[IMPORTANT]
+====
+*Do not start the workshop until every ArgoCD Application is `Synced` and `Healthy`.*
+
+Your lab cluster is bootstrapped by OpenShift GitOps (ArgoCD), and a freshly provisioned cluster is often still reconciling its Applications for several minutes after you can first log in. If you begin before the bootstrap settles, workloads the early modules depend on (the ISVCs, the ModelMesh model, the workbenches) may not exist yet.
+
+Run this *before* the next step -while auto-sync is still on, every Application should converge to `Synced`/`Healthy` on its own.
+====
+
+[NOTE]
+====
+*One Application is expected to stay `Progressing`: `rhoai-2254-operator-authorino`.* Its Subscription installs via *manual approval*, so it sits on a pending InstallPlan (which you approve later in the migration) and never reaches `Healthy` at this stage. The check below treats a `Progressing` `rhoai-2254-operator-authorino` as ready; every other Application must be `Synced`/`Healthy`.
+====
+
+The loop below polls every Application until they are all ready -`Synced`/`Healthy`, with the single authorino exception above -printing progress as it goes. It exits on its own once the cluster is ready (or after 20 minutes, whichever comes first).
+
+[.console-input]
+[source,role="execute"]
+----
+timeout=1200; interval=15; deadline=$(( $(date +%s) + timeout ))
+# rhoai-2254-operator-authorino installs via manual approval and stays
+# Progressing on a pending InstallPlan you approve later -treat it as ready.
+expected=rhoai-2254-operator-authorino
+while :; do
+  states=$(oc get applications.argoproj.io -A \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.sync.status}{" "}{.status.health.status}{"\n"}{end}')
+  total=$(printf '%s\n' "$states" | grep -c '[^[:space:]]' || true)
+  ready=$(printf '%s\n' "$states" | awk -v want="$expected" '
+    $2=="Synced" && $3=="Healthy" {c++; next}
+    $1==want && $3=="Progressing" {c++; next}
+    END {print c+0}')
+  echo "$(date '+%H:%M:%S')  ${ready}/${total} Applications ready"
+  if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
+    echo "All Applications are ready -you're clear to start."; break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "Timed out after ${timeout}s with $(( total - ready )) Application(s) not ready."; break
+  fi
+  sleep "$interval"
+done
+----
+
+=== Verify
+
+List every Application with its sync and health status. Confirm all rows read `Synced` / `Healthy` -except `rhoai-2254-operator-authorino`, which is expected to read `Synced` / `Progressing` -before continuing:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get applications.argoproj.io -A \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+----
+
+If any *other* Application is stuck `OutOfSync`, `Progressing`, `Degraded`, or `Missing` after the loop times out, inspect it before proceeding:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n <namespace> describe application.argoproj.io <name>
+----
+
 == Disable ArgoCD auto-sync
 
 [IMPORTANT]
