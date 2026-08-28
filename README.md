@@ -1,6 +1,6 @@
-# Migrating Red Hat OpenShift AI 2.25 to 3.3 — Showroom
+# Migrating Red Hat OpenShift AI 2.25 to 3.5 — Showroom
 
-A hands-on workshop that walks an OpenShift admin through an in-place migration of a **production-shaped** Red Hat OpenShift AI cluster from **2.25 to 3.3**.
+A hands-on workshop that walks an OpenShift admin through an in-place migration of a **production-shaped** Red Hat OpenShift AI cluster from **2.25 to 3.5**.
 
 The 2.x → 3.x jump is a migration, not a routine version bump: the routing layer moves from OpenShift Routes to **Kubernetes Gateway API**, authentication moves from `oauth-proxy` to `kube-rbac-proxy`, and several components your workloads currently depend on are **removed** — Serverless model serving, ModelMesh, embedded Kueue, and CodeFlare. Workloads have to be migrated off them, in the right order, before the components can be disabled.
 
@@ -15,7 +15,7 @@ The lab cluster starts in a realistic pre-migration state: KServe Serverless ISV
 | **3. Convert serving** | Convert Serverless ISVCs to RawDeployment; migrate the ModelMesh model to KServe. |
 | **4. Remediate platform** | Mark removed components `Removed`, patch the model-serving ConfigMap, drop the Service Mesh dependency, uninstall 2.x operators. |
 | **5. Workbench images** | Rebuild and re-register the custom workbench image for 3.x; stop every workbench. |
-| **6. Upgrade** | Drive the OLM upgrade through the migration channel to 3.3, then move to stable. |
+| **6. Upgrade** | Drive the OLM upgrade through the migration channel to 3.5, then move to stable. |
 | **7. Verify** | Confirm the platform, the converted models, the schema/HardwareProfiles, and the new auth model. |
 | **8. Re-test** | Re-run every Module 1 test against the migrated endpoints and diff the baseline. |
 

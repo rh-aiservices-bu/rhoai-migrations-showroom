@@ -80,7 +80,7 @@ my-serverless-isvc   RawDeployment    True
 
 ✓ The ISVC reports `RawDeployment` and `True`
 
-== Exercise 3.3: Confirm both Serverless conversions
+== Exercise 3.5: Confirm both Serverless conversions
 
 The single cluster-wide action already converted `ml-project-b` in the same run. Verify it the same way:
 
