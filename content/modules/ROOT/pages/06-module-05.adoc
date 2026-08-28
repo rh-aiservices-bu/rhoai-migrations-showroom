@@ -55,6 +55,16 @@ A custom workbench image built for 2.x makes two assumptions that 3.x breaks:
 
 The fix is a *rebuild* of the image, not a configuration tweak on the cluster. Red Hat does not auto-rebuild custom images -this is an application-owner task.
 
+[NOTE]
+====
+*Not every custom image needs a rebuild -triage each one first.* The image tag alone can't tell you which path an image takes:
+
+* *Built FROM the `2025.2` workbench base image* -the Gateway API / `NB_PREFIX` routing and the kube-rbac-proxy auth wiring are already baked in. Just *re-import* the image (Exercise 5.4) and apply the post-upgrade auth-model patch (the `workbenches.patch-auth-model` action, run in *Module 7*) -*no rebuild*.
+* *Merely tagged `2025.2` on an older base* -the tag is cosmetic; the image still assumes 2.x routing and *needs the full Kubernetes Gateway API rebuild* described below.
+
+Because the tag can't distinguish the two, *verify empirically*: after the upgrade, bring up *one workbench per unique image* and confirm it routes and authenticates before trusting the rest. The lab's `custom-scipy-notebook` is a 2.x community image on an older base, so it takes the rebuild path.
+====
+
 == Exercise 5.3: How the image was updated for 3.x
 
 The rebuild has already been done for you and the result is published at `quay.io/hayesphilip/rhoai-workbench-gw:3.x`. This exercise walks through *exactly* what changed in the Containerfile so you can do the same for your own images. Both the original 2.x BYON Containerfile (`examples/custom-workbench-2x/Containerfile`) and the rebuilt 3.x one (`examples/custom-workbench-gw/Containerfile`) ship with the workshop repo.
