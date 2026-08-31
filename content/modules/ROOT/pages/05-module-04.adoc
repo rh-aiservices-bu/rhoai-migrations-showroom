@@ -16,8 +16,9 @@ By the end of this module, you'll be able to:
 * Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs ahead of destructive component changes, and delete any LlamaStackDistributions
 * Update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist
 * Flip the removed DSC components (`ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`, and set `kueue` to `Removed` or `Unmanaged`
-* Remove the Service Mesh v2 dependency including the lingering member roll, leaving the Maistra Istio CRDs for Module 7
+* Remove the Service Mesh v2 dependency including the lingering member roll
 * Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
+* Remove the leftover Maistra Istio CRDs so the {target-version} Gateway API can install its own
 
 == Exercise 4.1: Back up the RayClusters
 
@@ -433,7 +434,7 @@ Do *not* remove `servicemeshoperator3` (OSSM v3). Only the v2 operator (`service
 
 [NOTE]
 ====
-*Uninstalling the SM2 operator leaves its CRDs behind.* OLM operator uninstall never removes CRDs, so the Maistra `*.istio.io` CRDs (destinationrules, virtualservices, gateways, …) — all labelled `maistra-version` — survive here. After the upgrade, the OpenShift Gateway API "sail" controller refuses to install its own `networking.istio.io/v1` CRDs while these foreign ones exist (`"Istio CRDs are managed by an unknown party"`), which blocks the {target-version} *Data Science Gateway* and leaves the DSC `Not Ready`. Do *not* delete them now. They are cleaned up, with a 0-CR safety check, in *Module 7* — this is "Gap 2" in that module's post-upgrade gap report.
+*OLM leaves the CSV copies behind for a few seconds.* A CSV is copied into every namespace on the cluster; deleting the *source* CSV makes OLM garbage-collect the copies, but the sweep is not instant. If the verify below still lists `servicemeshoperator.v2.6.17` rows in unrelated namespaces (`cert-manager`, `dspa-sample`, …), wait ~30 seconds and re-run it.
 ====
 
 === Verify
@@ -450,9 +451,74 @@ echo "--- check complete ---"
 --- check complete ---
 ----
 
-✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain (the `\.` filter leaves OSSM v3 untouched). The leftover `maistra-version` Istio CRDs are expected — Module 7 removes them.
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain (the `\.` filter leaves OSSM v3 untouched)
 
-== Exercise 4.12: Re-run the assessment
+== Exercise 4.12: Remove the leftover Service Mesh 2 Istio CRDs
+
+[IMPORTANT]
+====
+*This is the single highest-impact step in the module. Skip it and the upgrade in Module 6 lands with the DSC `Not Ready`.*
+
+OLM operator uninstall *never removes CRDs*, so uninstalling the Service Mesh 2 operator in Exercise 4.11 leaves ~22 Maistra CRDs behind — the `*.istio.io` ones (destinationrules, virtualservices, gateways, …) plus the `*.maistra.io` ones — all labelled `maistra-version=2.6.17`.
+
+After the upgrade, the OpenShift Gateway API "sail" controller *refuses to install its own `networking.istio.io/v1` CRDs while these foreign ones exist*. The ingress-operator log says it plainly: `"Istio CRDs are managed by an unknown party"`. The failure then cascades: `istiod-openshift-gateway` sticks at *0/1* → `Gateway/data-science-gateway` never programs → `GatewayConfig/default-gateway` gets no domain → *ModelRegistry* fails with `failed to compute gateway domain` → the *DSC sits `Not Ready`* with `ProvisioningFailed: modelregistry`.
+
+Removing the CRDs *here*, before the upgrade, avoids the whole chain. (Module 7 Exercise 7.2 documents the after-the-fact recovery if you skip this — but there is no reason to take the damage.)
+====
+
+These CRDs are safe to delete *because nothing on the cluster uses them any more* — you migrated every Serverless ISVC off Istio in Module 3, and the SMCP/SMMR are gone. Prove that first: the count below *must* be `0` before you delete anything.
+
+[.console-input]
+[source,role="execute"]
+----
+TOTAL=0
+for crd in $(oc get crd -l maistra-version -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+  KIND=$(oc get crd "$crd" -o jsonpath='{.spec.names.plural}.{.spec.group}')
+  N=$(oc get "$KIND" -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  TOTAL=$((TOTAL+N))
+  [ "$N" -gt 0 ] && echo "  NON-EMPTY: $crd -> $N custom resource(s)"
+done
+echo "CRDs labelled maistra-version: $(oc get crd -l maistra-version --no-headers | wc -l | tr -d ' ')"
+echo "Custom resources they hold:    $TOTAL"
+----
+
+[.console-output]
+----
+CRDs labelled maistra-version: 22
+Custom resources they hold:    0
+----
+
+If the total is `0`, delete them all by label:
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete crd -l maistra-version
+----
+
+[WARNING]
+====
+If the count is *not* `0`, stop. Something on the cluster still owns Istio resources — most likely a non-RHOAI application that was also using Service Mesh 2. Identify and migrate it (or confirm the resources are disposable) before deleting the CRDs, because deleting a CRD deletes every custom resource of that kind.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get crd -l maistra-version --no-headers 2>/dev/null | wc -l | tr -d ' '
+oc get crd 2>/dev/null | grep -E 'istio\.io|maistra\.io' || echo "no Istio/Maistra CRDs remain"
+----
+
+[.console-output]
+----
+0
+no Istio/Maistra CRDs remain
+----
+
+✓ Zero `maistra-version` CRDs remain, so the {target-version} Gateway API controller can install its own `v1` Istio CRDs cleanly during the upgrade
+
+== Exercise 4.13: Re-run the assessment
 
 Re-run the lint and confirm zero critical findings:
 
@@ -486,11 +552,12 @@ You've completed the platform remediation. You can:
 
 * [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
 * [x] Flip every removed component to `Removed` in the correct order
-* [x] Remove the Service Mesh v2 dependency including the lingering member roll, leaving the Maistra Istio CRDs for Module 7
+* [x] Remove the Service Mesh v2 dependency including the lingering member roll
+* [x] Delete the leftover Maistra Istio CRDs after a 0-CR safety check
 * [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary
 
-The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators *and their leftover Istio CRDs* are removed, and all four models are still serving on RawDeployment. Clearing those CRDs now is what lets the {target-version} Data Science Gateway program on the first attempt instead of leaving the DSC `Not Ready` after the upgrade. The last thing to handle before the upgrade is the workbenches and their images.
 
 Continue to *Module 5: Handle the workbench images*.

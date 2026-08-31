@@ -124,6 +124,27 @@ done
 
 Expect HTTP 200, 302, or 303 from each workbench.
 
+[WARNING]
+====
+*A 302 here does not prove the workbench is running -check the pods too.*
+
+The redirect is issued by the Gateway's auth layer *before* the request is routed to a workbench pod. A stopped workbench returns exactly the same `HTTP 302` as a healthy one, so this curl passes even when all four workbenches are down — which is the state you are in if you skipped Module 7 Exercise 7.9, since Module 5 stopped every one of them.
+
+Confirm the pods are actually up:
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  POD=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | awk '{print $2" "$3}')
+  echo "$nb  ${POD:-STOPPED - start it in Module 7 Exercise 7.9}"
+done
+----
+
+Every workbench must report `2/2 Running` (notebook container + `kube-rbac-proxy`).
+====
+
 === Verify
 
 [.console-input]

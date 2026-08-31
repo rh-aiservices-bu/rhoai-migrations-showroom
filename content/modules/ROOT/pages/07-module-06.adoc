@@ -195,7 +195,7 @@ spec:
 EOF
 ----
 
-Wait for the CSV `jobset-operator.v1.0.0` to reach `Succeeded`, then create the `JobSetOperator` operand CR named `cluster`. *Read the operand CRD's exact group/version off the cluster first* -it can differ between operator builds, so don't hardcode the `apiVersion` from this page:
+Wait for the CSV `jobset-operator.v1.0.0` to reach `Succeeded`, then create the `JobSetOperator` operand CR named `cluster`. *Read the operand CRD's exact group/version off the cluster first* -it can differ between operator builds, so don't hardcode the `apiVersion`:
 
 [.console-input]
 [source,role="execute"]
@@ -204,16 +204,28 @@ oc get csv -n jobset-system | grep jobset-operator.v1.0.0
 
 # discover the operand CRD and its served apiVersion (group/version)
 oc get crd | grep -i jobsetoperator
-oc get crd <jobsetoperator-crd-name> -o jsonpath='{.spec.group}/{.spec.versions[0].name}{"\n"}'
+oc get crd jobsetoperators.operator.openshift.io -o jsonpath='{.spec.group}/{.spec.versions[0].name}{"\n"}'
 ----
 
-Substitute the group/version reported above into `apiVersion`, then create the operand:
+[.console-output]
+----
+jobset-operator.v1.0.0              Job Set Operator           1.0.0     Succeeded
+jobsetoperators.operator.openshift.io
+operator.openshift.io/v1
+----
+
+[NOTE]
+====
+On the current `stable-v1.0` build the operand CRD is `jobsetoperators.operator.openshift.io` and its served group/version is *`operator.openshift.io/v1`* -*not* the upstream `operator.jobset.x-k8s.io/v1alpha1` that older notes reference. The manifest below uses the value confirmed on this lab; still run the two discovery commands above and substitute whatever your cluster reports, because this is the one field most likely to drift between operator builds.
+====
+
+Create the operand:
 
 [.console-input]
 [source,role="execute"]
 ----
 cat <<'EOF' | oc apply -f -
-apiVersion: operator.jobset.x-k8s.io/v1alpha1   # <-- replace with the value from the CRD above
+apiVersion: operator.openshift.io/v1   # <-- confirm against the CRD output above
 kind: JobSetOperator
 metadata:
   name: cluster

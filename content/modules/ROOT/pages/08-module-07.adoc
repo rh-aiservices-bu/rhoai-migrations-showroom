@@ -3,7 +3,7 @@
 :toc: macro
 :toclevels: 2
 
-The operator is on {target-version} and the DSC is `Ready`, but the migration isn't finished. The 3.x reconciler needs a few `rhai-cli migrate run` actions to bring components fully across (ConfigMap state, workbench auth, RayCluster CRs, GuardrailsOrchestrator schema, TrustyAI data). This module runs those actions and then sweeps every workload to confirm they survived the upgrade.
+The operator is on {target-version} and the DSC is `Ready`, but the migration isn't finished. The 3.x reconciler needs a few `rhai-cli migrate run` actions to bring components fully across (ConfigMap state, workbench auth, RayCluster CRs, GuardrailsOrchestrator schema, TrustyAI data). This module runs those actions, verifies the components no action covers, brings the workbenches back into service, clears the leftovers the removed controllers abandoned, and then sweeps every workload to confirm they survived the upgrade.
 
 == Learning objectives
 
@@ -12,6 +12,9 @@ By the end of this module, you'll be able to:
 * Confirm the operator, DSC, and DSCI are healthy on {target-version} and the Data Science Gateway is `Programmed`
 * Run the required post-upgrade `rhai-cli migrate run` actions (ConfigMap, workbenches, Ray, GuardrailsOrchestrator)
 * Recover the Data Science Gateway when leftover Service Mesh 2 Istio CRDs block it
+* Verify the components no migrate action covers (KFTO, Feature Store, TrustyAI)
+* Repoint the custom workbench image and bring every workbench back into service
+* Remove the orphaned ModelMesh runtime Deployment the removed controller left behind
 * Verify every workload on the cluster is healthy and the rhai-cli lint is clean
 
 == Exercise 7.1: Confirm platform health
@@ -53,7 +56,11 @@ The **Data Science Gateway must be `Programmed=True`** -the dashboard, model end
 
 [IMPORTANT]
 ====
-This is the *most common* reason a {target-version} upgrade lands with the DSC `Not Ready`. If Exercise 7.1 showed the gateway `Programmed=True`, skip to Exercise 7.3. If it showed `Programmed=False` (or empty), work through this exercise now -every component below depends on the gateway.
+*If you completed Module 4 Exercise 4.12, you should not need this exercise -skip to Exercise 7.3.*
+
+Deleting the `maistra-version` CRDs *before* the upgrade prevents this failure entirely: the gateway programs on the first attempt and the DSC reaches `Ready` within a minute or two of the operator reconciling. This exercise is the *recovery path* for a cluster that was upgraded with those CRDs still in place.
+
+Work through it only if Exercise 7.1 showed the gateway `Programmed=False` (or empty). Every component below depends on the gateway.
 ====
 
 Uninstalling the Service Mesh 2 (Maistra 2.6.17) operator in Module 6 removed the *operator*, but *OLM never removes CRDs*, so the old `*.istio.io` CRDs (serving only `v1beta1`/`v1alpha3`) stay behind. On OCP 4.20.31+/4.21.22+/4.22+, Service Mesh 3 is *not required* -the OCP built-in Gateway API ("sail" Istio) provides the control plane, and it *refuses to install its own `v1` CRDs while foreign Istio CRDs exist*. The result is a gateway that never programs.
@@ -105,7 +112,9 @@ oc get dsc default-dsc -o jsonpath='DSC: {.status.phase}{"\n"}'
 
 [NOTE]
 ====
-The `*.maistra.io` CRDs (servicemeshcontrolplanes, federation, etc.) hold 0 CRs and do *not* block the sail controller -they are harmless leftovers you can optionally remove too. This cleanup should have happened pre-upgrade in Module 4 Exercise 4.11 (`oc delete crd -l maistra-version`); doing it now is the recovery path.
+The `*.maistra.io` CRDs (servicemeshcontrolplanes, federation, etc.) hold 0 CRs and do *not* block the sail controller -they are harmless leftovers you can optionally remove too (`oc delete crd -l maistra-version` covers both sets).
+
+The recovery cascade is quick once the CRDs are gone -in lab testing `istiod-openshift-gateway` went `0/1` → `1/1` and the DSC returned to `Ready` roughly *90 seconds* after the ingress-operator restart. The cost of skipping Module 4 Exercise 4.12 is therefore not catastrophic, but it *does* leave the platform `Not Ready` for the entire window between the upgrade completing and this recovery running.
 ====
 
 == Exercise 7.3: Restore the inferenceservice-config ConfigMap
@@ -137,6 +146,37 @@ oc get isvc -A -o json | jq -r '["NAMESPACE","NAME","DEPLOYMENT_MODE","READY"], 
 == Exercise 7.4: Patch the workbenches onto the new auth model
 
 Workbenches still carry 2.x oauth-proxy configuration. Under 3.x they need kube-rbac-proxy or they hit redirect loops on first start. The `workbenches.patch-auth-model` migrate action patches each stopped workbench in place. It *prompts for confirmation twice* (once before patching, once before the OAuth cleanup) -enter `y` each time. A benign `phase pre-upgrade but effective phase is post-upgrade` warning may appear; ignore it.
+
+[WARNING]
+====
+*Answer `y` to the second prompt too -you cannot get the cleanup back by re-running the action.*
+
+The two prompts do different jobs: the first patches the Notebook CRs onto kube-rbac-proxy, the second deletes the legacy OAuth resources (`<name>-oauth-client` / `<name>-oauth-config` Secrets and the 2.x `<name>` Route in each workbench namespace).
+
+If you answer `n` to the second prompt (or your terminal swallows it), the patch still lands -so a re-run reports `Found 0 Notebook(s) needing patch, 4 already patched` and *exits without ever reaching the cleanup step*. The stale Routes are then left behind pointing at the removed oauth-proxy port, and they answer *HTTP 503* to anyone with a bookmarked 2.x workbench URL.
+
+Recover by deleting them yourself:
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  oc -n "$ns" delete route "$name" --ignore-not-found
+  oc -n "$ns" delete secret "${name}-oauth-client" "${name}-oauth-config" --ignore-not-found
+done
+----
+
+Then confirm nothing is left:
+
+[.console-input]
+[source,role="execute"]
+----
+for ns in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u); do
+  echo "--- $ns ---"; oc get secret,route -n "$ns" 2>/dev/null | grep -i oauth || echo "  clean"
+done
+----
+====
 
 [.console-input]
 [source,role="execute"]
@@ -195,6 +235,13 @@ oc get raycluster -A
 == Exercise 7.6: Patch the GuardrailsOrchestrators and restore TrustyAI
 
 Two *cluster-wide* actions cover every GuardrailsOrchestrator at once (no per-namespace loop): `trustyai.patch-guardrails` adds the missing ReadinessProbe; `trustyai.migrate-gorch-otel-exporter` rewrites `spec.otelExporter` to the 3.x schema. Preview each with `--dry-run` first if desired, then apply. A benign `phase pre-upgrade but effective phase is post-upgrade` warning may appear; ignore it:
+
+[NOTE]
+====
+*`trustyai.patch-guardrails` also prompts for confirmation* (`About to patch readinessProbe on N deployment(s) / Proceed with patching? [y/N]`) — enter `y`. Unlike the workbench action, this one *is* safely re-runnable: if you decline, the CR still needs the patch, so simply run it again and answer `y`.
+
+`trustyai.migrate-gorch-otel-exporter` does not prompt. On a cluster where the orchestrator is already on the new schema it reports `No GuardrailsOrchestrator CRs need otelExporter migration` and exits cleanly — that is a pass, not a skip.
+====
 
 [.console-input]
 [source,role="execute"]
@@ -274,7 +321,33 @@ oc exec -n rhai-migration rhai-cli-0 -- \
 
 [NOTE]
 ====
-*Llama Stack → OGX.* In {target-version}, Llama Stack was rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR was replaced by *`OGXServer` (v1beta1)*. The 2.x CRs were deleted pre-upgrade (Module 4 Exercise 4.4); recreate fresh `OGXServer` CRs, using the pre-upgrade archive only as *reference* (the SQLite data cannot be imported -3.x requires PostgreSQL 14+ and the `Vector_IO` API).
+*Llama Stack → OGX.* In {target-version}, Llama Stack was rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The 2.x CRs were deleted pre-upgrade (Module 4 Exercise 4.4). Any replacement is built fresh from the pre-upgrade archive as *reference only* -the SQLite data cannot be imported, since 3.x requires PostgreSQL 14+ and the `Vector_IO` API.
+
+[WARNING]
+====
+*On this lab build you cannot recreate the workload as an `OGXServer` -do not try.*
+
+The DSC exposes an `ogx` component, but the module is backed by a CRD (`ogxs.components.platform.opendatahub.io`) that this catalog does not ship, and there is no OGX packagemanifest in `openshift-marketplace`. Setting `ogx` to `Managed` therefore never satisfies:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get dsc default-dsc -o jsonpath='ogx={.spec.components.ogx.managementState}{"\n"}'
+oc get crd | grep -i ogx || echo "no OGX CRD on this cluster"
+oc get packagemanifests -n openshift-marketplace | grep -i ogx || echo "no OGX operator in catalog"
+----
+
+If you flip it to `Managed` anyway, `OGXReady` goes `False/NotReady` with `no matches for kind "OGX" in version "components.platform.opendatahub.io/v1alpha1"`, the operator logs `module CRDs not yet available, requesting requeue` forever, and *the whole DSC drops to `Not Ready`* — taking an otherwise healthy cluster down. Recover by setting it back:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge \
+  -p '{"spec":{"components":{"ogx":{"managementState":"Removed"}}}}'
+----
+
+Leave `ogx` as `Removed` on this cluster. `OGXReady=False` with `reason=Removed` is the correct, healthy end state here and does not block the DSC. Deploying an OGX server is a follow-on exercise for a cluster whose catalog actually carries the OGX operator.
+====
 
 *AI Pipelines.* The DSC v1→v2 conversion renames `.spec.components.datasciencepipelines` to *`aipipelines`* -the operator does this automatically on startup.
 
@@ -291,7 +364,189 @@ oc get isvc -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 ✓ Four ISVCs report `Ready=True`. The other resources above are present and healthy
 
-== Exercise 7.8: Final assessment
+== Exercise 7.8: Verify the components the migrate actions don't cover
+
+The `rhai-cli migrate` actions cover model serving, workbenches, Ray, Guardrails, and AI Pipelines. Three components on this cluster have a post-upgrade check that no action performs -run them by hand.
+
+*Kubeflow Training Operator.* PyTorchJobs should have run straight through the upgrade. The `training.verify-workloads` action enumerates every v1 training workload (PyTorchJob, TFJob, MPIJob, XGBoostJob) read-only:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pytorchjob -A
+
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli migrate run \
+  --migration training.verify-workloads --target-version {target-version}.0
+----
+
+[IMPORTANT]
+====
+*A `[BLOCKER]` here is expected on this lab and does not mean the upgrade failed.* The lab's PyTorchJob is still `Running`, so the action reports `1 active v1 job(s) must complete or be stopped before migration` and *exits with code 1*.
+
+That blocker is about a *future* migration to Kubeflow Trainer v2 -it is telling you an active v1 job would have to drain first. For the 2.25 → {target-version} upgrade you are doing here, the success criterion is simply that the job is still `Running` (or `Succeeded`) and appears in the same list as before the upgrade.
+====
+
+*Feature Store.* Feast moves from Tech Preview in {source-version} to GA in {target-version}. Confirm the operator is up and the store is `Ready`, then prove materialization actually still works by running one of its CronJobs on demand:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pods -n redhat-ods-applications | grep feast-operator
+oc get featurestores --all-namespaces
+oc get cronjobs -n project-alpha
+
+oc create job feast-postupgradetest --from=cronjob/feast-my-featurestore -n project-alpha
+oc get jobs -n project-alpha
+----
+
+✓ The Job reaches `Complete 1/1` (about 20-30 seconds) -a `Ready` FeatureStore alone only proves the CR reconciled, not that a materialization run succeeds
+
+*TrustyAI.* Confirm the operator and both services came back, and compare against the backups you took in Module 4 Exercise 4.2:
+
+[.console-input]
+[source,role="execute"]
+----
+oc wait --for=condition=Available \
+  deployment/trustyai-service-operator-controller-manager \
+  -n redhat-ods-applications --timeout=120s
+
+oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STORAGE:.spec.storage.format'
+oc get pods -n test-trustyaiservice
+oc get pods -n test-trustyaiservice-db
+----
+
+✓ Both TrustyAIServices report their pods `2/2 Running`. On this lab both namespaces backed up *0* scheduled metrics pre-upgrade, so "0 after" is a match and there is nothing to restore -on a production cluster, compare the live metric count against the backed-up JSON and restore with the `trustyai.metrics` action (Exercise 7.6) if any were lost.
+
+== Exercise 7.9: Bring the workbenches back into service
+
+Everything so far has verified the *platform*. The workbenches are still *stopped* — you stopped all four in Module 5 Exercise 5.6 and nothing has started them since. A migrated cluster with every workbench down is not yet operational.
+
+There are two jobs here: repoint the custom workbench at the image you registered in Module 5, and start everything.
+
+*First, repoint the custom (BYON) workbench.* Module 5 added the `3.x` tag to the ImageStream, but the existing `custom` Notebook still pins the *2.x* image. Patch it while it is stopped:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebook custom -n workbenches-regular \
+  -o jsonpath='before: {.spec.template.spec.containers[0].image}{"\n"}'
+
+NEW=$(oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
+  -o jsonpath='{range .status.tags[?(@.tag=="3.x")]}{.items[0].dockerImageReference}{end}')
+echo "repointing to: $NEW"
+
+oc -n workbenches-regular patch notebook custom --type=json \
+  -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/image\",\"value\":\"$NEW\"}]"
+
+oc -n workbenches-regular annotate notebook custom \
+  opendatahub.io/image-display-name="Custom | SciPy + mlflow + onnxruntime (BYON 3.x Gateway API)" --overwrite
+----
+
+*Then start every workbench.* Starting is the inverse of Module 5: *remove* the `kubeflow-resource-stopped` annotation (the trailing `-` deletes it). Setting it to `false` or `""` does not work -the controller treats *any* present value as stopped:
+
+[.console-input]
+[source,role="execute"]
+----
+for row in $(oc get notebooks -A --no-headers | awk '{print $1"/"$2}'); do
+  ns="${row%/*}"; name="${row##*/}"
+  oc -n "$ns" annotate notebook "$name" kubeflow-resource-stopped- --overwrite
+done
+----
+
+=== Verify
+
+Each workbench should reach `2/2 Running` — the notebook container plus the new `kube-rbac-proxy` sidecar. Allow a couple of minutes for image pulls:
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  POD=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | awk '{print $2" "$3}')
+  IMG=$(oc -n "$ns" get notebook "$name" -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's|.*/||')
+  echo "$nb  ${POD:-<no pod>}  image=$IMG"
+done
+----
+
+[.console-output]
+----
+workbenches-hwp/jupyter-2025-1  2/2 Running  image=jupyter-datascience-cpu-py312-ubi9:2025.1
+workbenches-regular/codeserver-2025-1  2/2 Running  image=code-server-notebook:2025.2
+workbenches-regular/custom  2/2 Running  image=rhoai-workbench-gw@sha256:d0dca2b4...
+workbenches-regular/jupyter-2025-1  2/2 Running  image=jupyter-datascience-cpu-py312-ubi9:2025.1
+----
+
+✓ All four workbenches are `2/2 Running`, and `custom` is on the rebuilt `rhoai-workbench-gw` image rather than the 2.x one
+
+Confirm the custom image actually honours the Gateway's path prefix — this is the whole point of the Module 5 rebuild. Query it *inside* the pod so you bypass the auth redirect:
+
+[.console-input]
+[source,role="execute"]
+----
+PREFIX=$(oc -n workbenches-regular exec custom-0 -c custom -- printenv NB_PREFIX | tr -d '\r')
+echo "NB_PREFIX=$PREFIX"
+oc -n workbenches-regular exec custom-0 -c custom -- \
+  curl -s -o /dev/null -w "under prefix -> HTTP %{http_code}\n" --max-time 20 "http://localhost:8888${PREFIX}/"
+----
+
+✓ The request under `${NB_PREFIX}` returns `200` or `302` (not `404`) -the server is serving under the controller-supplied base URL
+
+[NOTE]
+====
+The two Jupyter workbenches remain on the `2025.1` tag and run fine. Bumping OOTB Jupyter images to `2025.2` is *recommended* but not required (unlike code-server, which you already bumped in Module 5 because it *is* required). Repoint them the same way as `custom` if you want every image current.
+====
+
+== Exercise 7.10: Remove the orphaned ModelMesh runtime Deployment
+
+Disabling `modelmeshserving` in Module 4 removed the ModelMesh *controller*, and the DSC v1→v2 conversion dropped the field entirely. But the Deployment that controller created for the multi-model runtime — `modelmesh-serving-<runtime>` — is left running. Nothing reaps it, because the controller that owned it no longer exists. On this lab it is a *5-container* pod idling indefinitely.
+
+[.console-input]
+[source,role="execute"]
+----
+oc get deploy,pods -n ml-project-c | grep -i modelmesh
+----
+
+[.console-output]
+----
+deployment.apps/modelmesh-serving-ovms-mm     1/1   1   1   4h30m
+pod/modelmesh-serving-ovms-mm-55f69bd887-zphtp   5/5   Running   1   4h30m
+----
+
+Your converted model runs on its *own* `my-modelmesh-isvc-predictor` Deployment, so removing this one does not touch it. Confirm the model serves, delete the orphan, then confirm it still serves:
+
+[.console-input]
+[source,role="execute"]
+----
+oc -n ml-project-c exec deploy/my-modelmesh-isvc-predictor -c kserve-container -- \
+  curl -s -o /dev/null -w 'model before -> HTTP %{http_code}\n' --max-time 20 \
+  http://localhost:8888/v2/models/my-modelmesh-isvc
+
+oc delete deployment modelmesh-serving-ovms-mm -n ml-project-c
+
+oc -n ml-project-c exec deploy/my-modelmesh-isvc-predictor -c kserve-container -- \
+  curl -s -o /dev/null -w 'model after  -> HTTP %{http_code}\n' --max-time 20 \
+  http://localhost:8888/v2/models/my-modelmesh-isvc
+----
+
+[NOTE]
+====
+Do *not* delete the `ovms-mm` ServingRuntime. It owns this Deployment via `ownerReferences`, but Module 3 converted it in place into the *single-model* runtime your migrated ISVC still uses (`multiModel=false`, container `kserve-container`). Deleting the Deployment alone is safe; deleting the runtime would take the model with it.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get pods -n ml-project-c --no-headers | grep -v seed
+oc get isvc my-modelmesh-isvc -n ml-project-c \
+  -o jsonpath='ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+----
+
+✓ Only `my-modelmesh-isvc-predictor` remains, the model still answers `HTTP 200`, and the ISVC reports `ready=True`
+
+== Exercise 7.11: Final assessment
 
 Re-run the rhai-cli lint to confirm the tool sees a healthy cluster on {target-version}. `lint` is a pre-upgrade gate: when the current version already equals the target, it short-circuits with a "no checks will be executed" line -that itself is the pass signal. Your post-upgrade confidence comes from the per-component verifications above and the Module 8 workload re-tests, not from re-running lint.
 
@@ -336,6 +591,18 @@ Current and target versions are the same (3.5), no checks will be executed.
 
 *Solution*: Inspect each with `oc describe notebook <name> -n <ns>`. The most common cause is a custom workbench image that still embeds oauth-proxy and must be rebuilt for kube-rbac-proxy.
 
+*Issue*: A workbench starts but comes up on its *old* 2.x image.
+
+*Solution*: Re-registering an ImageStream (Module 5 Exercise 5.4) does not rewrite existing Notebook CRs -they pin their own image reference. Repoint the Notebook itself as shown in Exercise 7.9.
+
+*Issue*: The DSC goes `Not Ready` with `OGXReady=False / NotReady` and the operator logs `module CRDs not yet available, requesting requeue`.
+
+*Solution*: The `ogx` component was set to `Managed` on a cluster whose catalog does not ship the OGX operator. Set it back to `Removed` (see the WARNING in Exercise 7.7); `OGXReady=False` with `reason=Removed` is the correct end state here.
+
+*Issue*: `training.verify-workloads` exits non-zero with a `[BLOCKER]`.
+
+*Solution*: Expected when a PyTorchJob is still `Running`. It concerns a future Kubeflow Trainer v2 migration, not this upgrade -see Exercise 7.8.
+
 == Learning outcomes
 
 You've completed the platform-side migration. You can:
@@ -343,14 +610,17 @@ You've completed the platform-side migration. You can:
 * [x] Confirm the operator, DSC, and DSCI are healthy on {target-version} and the Data Science Gateway is `Programmed`
 * [x] Recover the gateway from leftover Service Mesh 2 Istio CRDs
 * [x] Restore the `inferenceservice-config` ConfigMap to managed
-* [x] Patch workbenches onto kube-rbac-proxy
+* [x] Patch workbenches onto kube-rbac-proxy, including the legacy OAuth resource cleanup
 * [x] Migrate RayClusters to KubeRay
 * [x] Patch GuardrailsOrchestrators with both cluster-wide actions
+* [x] Verify KFTO, Feature Store, and TrustyAI by hand
+* [x] Repoint the custom workbench image and restart every workbench
+* [x] Remove the orphaned ModelMesh runtime Deployment
 * [x] Confirm every workload that was running pre-upgrade is healthy post-upgrade
 * [x] Drive the rhai-cli lint to a clean result
 
 == Module summary
 
-Platform-side, the cluster is fully migrated to {target-version}. The four ISVCs serve on Standard (formerly RawDeployment) deployment mode through Gateway API, the workbenches are patched, RayClusters are on KubeRay, Guardrails are on the new schema, and the lint is clean. Module 8 closes the loop by running simple smoke tests on the user-visible workloads -inference, workbench access, pipelines, Ray jobs.
+The cluster is fully migrated to {target-version} *and back in service*. The four ISVCs serve on Standard (formerly RawDeployment) deployment mode through Gateway API, all four workbenches are patched onto kube-rbac-proxy and running again — the custom one on its rebuilt Gateway-API image — RayClusters are on KubeRay, Guardrails are on the new schema, KFTO / Feast / TrustyAI are verified, the retired ModelMesh controller's orphaned Deployment is gone, and the lint is clean. Module 8 closes the loop by running simple smoke tests on the user-visible workloads -inference, workbench access, pipelines, Ray jobs.
 
 Continue to *Module 8: Re-test the migrated workloads*.
