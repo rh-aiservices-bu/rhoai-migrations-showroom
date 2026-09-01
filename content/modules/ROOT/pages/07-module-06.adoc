@@ -5,14 +5,15 @@
 
 The cluster is pre-upgrade-clean: models converted to RawDeployment, removed components disabled, 2.x operators uninstalled, workbenches stopped. Now you'll trigger the migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to {target-version}.
 
-The migration channel is separate from the normal release channels so the upgrade can't be triggered by accident. You'll see OLM walk the upgrade graph one release at a time. When it's done, you'll move the subscription onto the stable channel for ongoing patches.
+The migration channel is separate from the normal release channels so the upgrade can't be triggered by accident -and it's the only channel that provides the cross-major 2.25->{target-version} path (its edge carries `skipRange >=2.25.10 <2.26.0`, so any 2.25.10+ patch resolves straight to {target-version}). When the operator is on {target-version}, you'll install the JobSet operator that Kueue now depends on, then move the subscription onto the stable channel for ongoing patches.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
 * Switch the operator subscription to the `{migration-channel}` migration channel
-* Approve the OLM InstallPlans as the upgrade walks to {target-version}
+* Approve the OLM InstallPlan as the upgrade resolves to {target-version}
+* Install the JobSet operator that Kueue depends on in {target-version}
 * Confirm the operator and DSC reach a healthy state on the new version
 * Move the subscription to the `{stable-channel}` channel for ongoing updates
 
@@ -31,7 +32,7 @@ oc -n redhat-ods-operator get subscription rhods-operator \
 ----
 channel=stable-2.25
 approval=Manual
-installedCSV=rhods-operator.2.25.9
+installedCSV=rhods-operator.2.25.10
 ----
 
 See which channels the catalog offers:
@@ -45,10 +46,10 @@ oc get packagemanifest rhods-operator -n openshift-marketplace \
 
 [.console-output]
 ----
-stable-3.3                 rhods-operator.3.3.5
-stable-3.4                 rhods-operator.3.4.2
-stable-3.x                 rhods-operator.3.4.2
-support-required-upgrade   rhods-operator.3.3.5
+stable-3.4                     rhods-operator.3.4.2
+stable-3.5                     rhods-operator.3.5.0
+stable-3.x                     rhods-operator.3.5.0
+support-required-upgrade-3.5   rhods-operator.3.5.0
 ----
 
 === Verify
@@ -67,7 +68,7 @@ oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='{.spec.in
 [source,role="execute"]
 ----
 oc -n redhat-ods-operator patch subscription rhods-operator --type=merge -p '{
-  "spec": { "channel": "support-required-upgrade" }
+  "spec": { "channel": "support-required-upgrade-3.5" }
 }'
 ----
 
@@ -90,7 +91,7 @@ oc -n redhat-ods-operator get subscription rhods-operator -o jsonpath='channel={
 
 [.console-output]
 ----
-channel=support-required-upgrade
+channel=support-required-upgrade-3.5
 ----
 
 ✓ The subscription is on the migration channel and an unapproved InstallPlan exists
@@ -99,10 +100,10 @@ channel=support-required-upgrade
 
 [IMPORTANT]
 ====
-OLM walks the upgrade graph one release at a time -it does not jump straight to {target-version}. From a cluster on `2.25.9` you'll see *one* InstallPlan (`2.25.9` to `3.3.5`). From an earlier 2.25 patch you may see *two* in sequence. Each requires its own approval because the channel uses Manual approval.
+Because the `support-required-upgrade-3.5` edge carries `skipRange >=2.25.10 <2.26.0`, any 2.25.10+ patch resolves to a *single* InstallPlan straight to {target-version} -there is no intermediate 2.25.z hop. Approve it under Manual approval mode. If OLM does generate more than one InstallPlan, approve each in sequence -the loop below handles either case.
 ====
 
-This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`:
+This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`. If OLM generates a follow-on InstallPlan, the loop approves that too:
 
 [.console-input]
 [source,role="execute"]
@@ -117,8 +118,8 @@ while (( $(date +%s) < deadline )); do
     sleep 30
     continue
   fi
-  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.3.5 -o jsonpath='{.status.phase}' 2>/dev/null)
-  echo "rhods-operator.3.3.5 phase: ${phase:-<pending>}"
+  phase=$(oc -n redhat-ods-operator get csv rhods-operator.3.5.0 -o jsonpath='{.status.phase}' 2>/dev/null)
+  echo "rhods-operator.3.5.0 phase: ${phase:-<pending>}"
   [ "$phase" = "Succeeded" ] && break
   sleep 30
 done
@@ -134,14 +135,14 @@ oc get csv -n redhat-ods-operator | grep rhods-operator
 
 [.console-output]
 ----
-rhods-operator.3.3.5   Red Hat OpenShift AI   3.3.5   rhods-operator.2.25.9   Succeeded
+rhods-operator.3.5.0   Red Hat OpenShift AI   3.5.0   rhods-operator.2.25.10   Succeeded
 ----
 
 [WARNING]
 ====
 *Do not approve the Service Mesh Operator 3 upgrade to 3.4.0.* Once RHOAI {target-version} is installed, OLM parks a separate "upgrade available" InstallPlan in front of the `servicemeshoperator3` subscription. This is a *different operator* from the `rhods-operator` InstallPlans you just approved — the loop above only touches `redhat-ods-operator`.
 
-On OCP 4.19–4.21 the cluster-ingress-operator hardcodes the Gateway API Istio version to `v1.26.2`, and OSSM 3.4.0 rejects that version as end-of-life. Approving it leaves `openshift-gateway` in a permanent `ReconcileError` with *no supported downgrade*. Keep the Service Mesh Operator on `installPlanApproval: Manual` and pin it ≤ 3.3.x until link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^] ship a fix. Confirm no 3.4.0 InstallPlan is auto-approved:
+On OCP 4.19–4.21 the cluster-ingress-operator hardcodes the Gateway API Istio version to `v1.26.2`, and OSSM 3.4.0 rejects that version as end-of-life. Approving it leaves `openshift-gateway` in a permanent `ReconcileError` with *no supported downgrade*. Keep the Service Mesh Operator on `installPlanApproval: Manual` and pin it ≤ 3.5.x until link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^] ship a fix. Confirm no 3.4.0 InstallPlan is auto-approved:
 
 [.console-input]
 [source,role="execute"]
@@ -159,9 +160,95 @@ oc get installplan -n openshift-operators \
 oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayName=="Red Hat OpenShift AI")]}{.metadata.name} {.status.phase}{"\n"}{end}'
 ----
 
-✓ `rhods-operator.3.3.5` is `Succeeded` and no `rhods-operator.2.*` CSV remains
+✓ `rhods-operator.3.5.0` is `Succeeded` and no `rhods-operator.2.*` CSV remains
 
-== Exercise 6.4: Wait for the DSC and DSCI to settle
+== Exercise 6.4: Install the JobSet operator
+
+New in {target-version}: Kueue depends on the *JobSet* operator. Without it the DSC stays *Not Ready* with `KueueReady=False`. Install it into its *own* namespace with an *OwnNamespace* OperatorGroup -do *not* use `openshift-operators`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc create namespace jobset-system
+
+cat <<'EOF' | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: jobset-operator
+  namespace: jobset-system
+spec:
+  targetNamespaces:
+    - jobset-system
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: job-set
+  namespace: jobset-system
+spec:
+  channel: stable-v1.0
+  name: job-set
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+----
+
+Wait for the CSV `jobset-operator.v1.0.0` to reach `Succeeded`, then create the `JobSetOperator` operand CR named `cluster`. *Read the operand CRD's exact group/version off the cluster first* -it can differ between operator builds, so don't hardcode the `apiVersion`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get csv -n jobset-system | grep jobset-operator.v1.0.0
+
+# discover the operand CRD and its served apiVersion (group/version)
+oc get crd | grep -i jobsetoperator
+oc get crd jobsetoperators.operator.openshift.io -o jsonpath='{.spec.group}/{.spec.versions[0].name}{"\n"}'
+----
+
+[.console-output]
+----
+jobset-operator.v1.0.0              Job Set Operator           1.0.0     Succeeded
+jobsetoperators.operator.openshift.io
+operator.openshift.io/v1
+----
+
+[NOTE]
+====
+On the current `stable-v1.0` build the operand CRD is `jobsetoperators.operator.openshift.io` and its served group/version is *`operator.openshift.io/v1`* -*not* the upstream `operator.jobset.x-k8s.io/v1alpha1` that older notes reference. The manifest below uses the value confirmed on this lab; still run the two discovery commands above and substitute whatever your cluster reports, because this is the one field most likely to drift between operator builds.
+====
+
+Create the operand:
+
+[.console-input]
+[source,role="execute"]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: operator.openshift.io/v1   # <-- confirm against the CRD output above
+kind: JobSetOperator
+metadata:
+  name: cluster
+spec: {}
+EOF
+----
+
+[NOTE]
+====
+If you set Kueue to *`Unmanaged`* (external RHBOK) earlier, JobSet is what lets `KueueReady` reach `True`. If you set Kueue to *`Removed`*, `KueueReady=False` is *expected* and does *not* block the DSC -JobSet is still installed here so the platform is ready if you later enable Kueue.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get crd jobsets.jobset.x-k8s.io
+----
+
+✓ The `jobsets.jobset.x-k8s.io` CRD is present -the JobSet operator is installed
+
+== Exercise 6.5: Wait for the DSC and DSCI to settle
 
 The new operator reconciles the DSC and DSCI under the 3.x model. Wait for both to return to `Ready`:
 
@@ -195,21 +282,21 @@ DSCI: Ready
 
 ✓ Both the DSC and DSCI are `Ready` under {target-version}
 
-== Exercise 6.5: Move off the migration channel
+== Exercise 6.6: Move off the migration channel
 
-The `{migration-channel}` channel is a one-shot trigger -it does not advance to later 3.3.x patch releases. Leaving the subscription there means no ongoing z-stream updates. Move it to the stable 3.3 channel:
+The `{migration-channel}` channel is a one-shot trigger -it does not advance to later 3.5.x patch releases. Leaving the subscription there means no ongoing z-stream updates. Move it to the stable 3.5 channel:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc patch subscription rhods-operator -n redhat-ods-operator --type=merge -p '{
-  "spec": { "channel": "stable-3.3" }
+  "spec": { "channel": "stable-3.5" }
 }'
 ----
 
 [NOTE]
 ====
-Choose `{stable-channel}` (stays on the 3.3 z-stream) rather than `stable-3.x` (which would eventually offer a 3.4 minor upgrade -a separate planning decision).
+Choose `{stable-channel}` (stays on the 3.5 z-stream) rather than `stable-3.x` (which would eventually offer a later minor upgrade -a separate planning decision).
 ====
 
 === Verify
@@ -223,10 +310,10 @@ oc get subscription rhods-operator -n redhat-ods-operator \
 
 [.console-output]
 ----
-channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.5
+channel=stable-3.5  state=AtLatestKnown  installedCSV=rhods-operator.3.5.0
 ----
 
-✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.3.5`
+✓ The subscription is on `{stable-channel}`, state `AtLatestKnown`, on `rhods-operator.3.5.0`
 
 == Troubleshooting
 
@@ -236,7 +323,7 @@ channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.5
 
 *Issue*: No InstallPlan appears after the channel switch.
 
-*Solution*: Confirm the channel name is exactly `support-required-upgrade` and that the catalog offers it: `oc get packagemanifest rhods-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
+*Solution*: Confirm the channel name is exactly `support-required-upgrade-3.5` and that the catalog offers it: `oc get packagemanifest rhods-operator -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'`.
 
 *Issue*: DSC stays `Not Ready` after the upgrade.
 
@@ -247,7 +334,8 @@ channel=stable-3.3  state=AtLatestKnown  installedCSV=rhods-operator.3.3.5
 You've completed the upgrade. You can:
 
 * [x] Switch the subscription to the `{migration-channel}` migration channel
-* [x] Approve the OLM upgrade as it walks to {target-version}
+* [x] Approve the OLM upgrade as it resolves to {target-version}
+* [x] Install the JobSet operator that Kueue depends on
 * [x] Confirm the operator, DSC, and DSCI are healthy on the new version
 * [x] Move the subscription to `{stable-channel}` for ongoing updates
 

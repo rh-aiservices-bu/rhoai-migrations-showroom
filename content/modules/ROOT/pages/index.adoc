@@ -1,13 +1,13 @@
-= Migrating Red Hat OpenShift AI 2.25 to 3.3
+= Migrating Red Hat OpenShift AI {source-version} to {target-version}
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
 toc::[]
 
-Welcome to the Red Hat OpenShift AI migration workshop. You'll take a *production-shaped* OpenShift AI 2.25 cluster through an in-place migration to 3.3 -and unlike a clean demo cluster, this one has real workloads that don't survive a naive upgrade.
+Welcome to the Red Hat OpenShift AI migration workshop. You'll take a *production-shaped* OpenShift AI {source-version} cluster through an in-place migration to {target-version} -and unlike a clean demo cluster, this one has real workloads that don't survive a naive upgrade.
 
-This is a *migration*, not a routine version bump. Moving from 2.25 to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), and *removes* several components your workloads currently depend on: Serverless model serving, ModelMesh, embedded Kueue, and CodeFlare. You can't just disable those components -you have to migrate the workloads off them first, in the right order, or you lose running models.
+This is a *migration*, not a routine version bump. Moving from {source-version} to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), *removes* several components your workloads currently depend on -Serverless model serving, ModelMesh, and CodeFlare -and *replaces* the embedded Kueue with the external Red Hat build of Kueue (RHBOK). You can't just disable the removed components -you have to migrate the workloads off them first, in the right order, or you lose running models.
 
 == Prerequisites
 
@@ -145,15 +145,41 @@ oc get applications.argoproj.io -A -o jsonpath='{range .items[*]}{.metadata.name
   done
 ----
 
+[IMPORTANT]
+====
+*Clearing `syncPolicy.automated` is not enough on its own -you must also terminate any sync operation that is already in flight.*
+
+An ArgoCD sync that started *before* you cleared the policy keeps running under its own `retry` block (these Applications ship with `retry.limit: 60` and a backoff up to 2m). Each retry re-applies the Git manifests, so it will happily undo your work *tens of minutes* after auto-sync is "disabled" -with `AUTOMATED` reading `<none>` the whole time.
+
+On a freshly provisioned lab cluster this is not hypothetical: `rhoai-2254-sample-kserve-modelmesh` is routinely still syncing at this point. If you skip this, it re-applies the original ModelMesh `ServingRuntime` partway through Module 4 and re-introduces the `ModelMesh ServingRuntime` critical you already cleared in Module 3.
+
+Run this immediately after the disable loop:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get applications.argoproj.io -A -o json \
+  | jq -r '.items[] | select(.operation != null) | "\(.metadata.namespace) \(.metadata.name)"' \
+  | while read -r NS NAME; do
+      echo "Terminating in-flight sync operation on $NAME"
+      oc -n "$NS" patch application.argoproj.io "$NAME" --type=merge -p '{"operation":null}'
+    done
+----
+====
+
 === Verify
 
-Every row must show `<none>` in the `AUTOMATED` column. If any row still shows a policy, re-run the disable loop before continuing:
+Every row must show `<none>` in the `AUTOMATED` column, *and* no Application may still carry a running `operation`. If either check fails, re-run the corresponding loop before continuing:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc get applications.argoproj.io -A \
   -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,AUTOMATED:.spec.syncPolicy.automated'
+
+oc get applications.argoproj.io -A -o json \
+  | jq -r '.items[] | select(.operation != null) | "STILL SYNCING: \(.metadata.name)"'
+echo "--- no Application should be listed as STILL SYNCING ---"
 ----
 
 == The starting cluster

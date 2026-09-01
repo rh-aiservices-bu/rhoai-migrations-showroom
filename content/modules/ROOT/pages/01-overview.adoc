@@ -11,10 +11,11 @@ You are the *cluster administrator* responsible for a production Red Hat OpenShi
 
 Previous OpenShift AI version bumps were routine operator upgrades. The move to 3.x is different. In a single transition:
 
-* *Components are removed*: KServe Serverless mode, ModelMesh Serving, the embedded Kueue, and CodeFlare are all gone in 3.x. The embedded Service Mesh dependency is dropped. You cannot simply disable these -any workload running on them must be migrated off *first*, or it stops serving.
+* *Components are removed*: KServe Serverless mode, ModelMesh Serving, and CodeFlare are all gone in 3.x. The embedded Kueue is replaced by the external Red Hat build of Kueue (RHBOK), and the embedded Service Mesh dependency is dropped. You cannot simply disable these -any workload running on them must be migrated off *first*, or it stops serving.
+* *Components are renamed*: Llama Stack is rebranded as *OGX (Open GenAI Stack)* -the `LlamaStackDistribution` CR is replaced by `OGXServer` (v1beta1) -and `RawDeployment` model serving is displayed as *Standard* in {target-version}.
 * *Routing changes*: OpenShift Routes are replaced by Kubernetes Gateway API. Model endpoint URLs and the dashboard URL change.
 * *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched, and custom images rebuilt.
-* *Schema changes*: HardwareProfiles move to a new API group with renamed objects. (Architectural notes also describe a future DSC `datasciencepipelines` → `aipipelines` rename; that rename has not shipped in {target-version} and the DSC schema still uses `datasciencepipelines`.)
+* *Schema changes*: HardwareProfiles move to a new API group with renamed objects, and the DSC/DSCI move from the v1 to the v2 API -the operator converts them automatically on startup (including the `datasciencepipelines` → `aipipelines` rename, and dropping the removed `modelmeshserving` and `codeflare` fields).
 
 Because so much changes at once, *there is no automated rollback*. In production, the only way back is restoring from a verified backup. In this lab the cluster is disposable, so you'll focus on the migration mechanics.
 
@@ -24,7 +25,7 @@ The single most important idea in this workshop is *sequencing*. You must migrat
 
 . *Convert the Serverless ISVCs to RawDeployment* -so they survive when Serverless mode is removed.
 . *Migrate the ModelMesh model to KServe* -so it survives when ModelMesh is removed.
-. *Only then* disable Serverless, ModelMesh, Kueue, and CodeFlare on the DSC.
+. *Only then* disable Serverless, ModelMesh, and CodeFlare on the DSC, and set Kueue to `Removed` or `Unmanaged` (external RHBOK).
 . *Tear down the Service Mesh dependency*, including a member roll that the operator leaves behind.
 . *Handle the workbenches* -bump images you can, plan rebuilds for the rest, and stop them all.
 . *Upgrade*, then verify everything came back.
@@ -43,7 +44,7 @@ By the end of this workshop you will be able to:
 
 * Capture a pre-migration baseline of every user-facing workload and diff against it post-upgrade
 * Run `rhai-cli lint` and distinguish critical findings from warnings -and know its limits as an inventory
-* Convert Serverless InferenceServices to RawDeployment using the migration guide's `serverless-to-raw.sh` helper
+* Convert Serverless InferenceServices to RawDeployment (displayed as *Standard* in 3.x) using the `rhai-cli migrate` model-serving actions
 * Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
 * Disable removed components in the correct order, and tear down the Service Mesh dependency cleanly
 * Discover and triage custom workbench images for the new auth and routing model

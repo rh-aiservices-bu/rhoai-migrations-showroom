@@ -3,7 +3,7 @@
 :toc: macro
 :toclevels: 2
 
-With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path, so the action is delete pre-upgrade and recreate fresh post-upgrade (data archival is out of scope here). This module starts with backups, deletes the LSDs, then runs the disables, then the 3.x prerequisites, then operator uninstalls.
+With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path (and Llama Stack is rebranded OGX in {target-version}), so the action is delete pre-upgrade and recreate fresh as an `OGXServer` post-upgrade (a configuration archive is available for reference only). This module starts with backups, deletes the LSDs, then runs the disables, then the {target-version} prerequisites, then operator uninstalls.
 
 In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 7, update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, and finally uninstall the 2.x serving operators.
 
@@ -15,34 +15,48 @@ By the end of this module, you'll be able to:
 
 * Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs ahead of destructive component changes, and delete any LlamaStackDistributions
 * Update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist
-* Flip the removed DSC components (`kueue`, `ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`
-* Remove the Service Mesh v2 dependency including the lingering member roll and leftover Istio CRDs
+* Flip the removed DSC components (`ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`, and set `kueue` to `Removed` or `Unmanaged`
+* Remove the Service Mesh v2 dependency including the lingering member roll
 * Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
+* Remove the leftover Maistra Istio CRDs so the {target-version} Gateway API can install its own
 
 == Exercise 4.1: Back up the RayClusters
 
-The `codeflare` operator is removed in 3.x; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields. Run this *before* Exercise 4.7 — the helper requires CodeFlare to still be installed.
+The `codeflare` operator is removed in {target-version}; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields.
 
 [IMPORTANT]
 ====
-Despite the name, `ray_cluster_migration.py pre-upgrade` does more than back up. It *also*:
+Unlike the old 2.x helper script, the `raycluster.backup` action does *not* flip `codeflare` for you — and it *fails if CodeFlare is still `Managed`*. You must set `codeflare` to `Removed` in the DSC *manually, before* running the backup. Disabling CodeFlare is also a hard {target-version} upgrade prerequisite, required even if you have no RayClusters.
 
-* Patches the DSC to set `codeflare.managementState=Removed` (the same flip Exercise 4.7 makes).
-* Deletes the CodeFlare-owned `ray-dashboard-*` and `rayclient-*` OpenShift Routes owned by each RayCluster.
-
-Both are prerequisites for KubeRay to take over cleanly. RayCluster pods keep serving throughout. Exercise 4.7 is still safe to run — the DSC patch is a no-op there because the field is already `Removed`.
+Do this only when you are ready to upgrade: CodeFlare provides essential security configuration for user-created RayClusters, so if you set it `Removed` and then delay the upgrade, users could create RayClusters while CodeFlare is absent.
 ====
+
+Set `codeflare` to `Removed` first (Exercise 4.7 later re-applies this alongside `ray` — it's a no-op there because the field is already `Removed`):
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -- \
-  python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py pre-upgrade
-
-oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/ray ./ray-backup
+oc patch $(oc get dsc -o name | head -n1) --type=merge \
+  -p '{"spec":{"components":{"codeflare":{"managementState":"Removed"}}}}'
 ----
 
-✓ `./ray-backup/rhoai-2.x/` and `./ray-backup/rhoai-3.x/` each contain one YAML per RayCluster. `oc get raycluster -A` still shows both clusters `ready`.
+The `raycluster.backup` action is non-destructive — it only reads and archives CR configuration. List the RayClusters to be captured, create the backup directory, then run the action from inside the rhai-cli pod:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get rayclusters -A
+
+oc exec -n rhai-migration rhai-cli-0 -- bash -c "
+  mkdir -p /tmp/rhoai-upgrade-backup/ray_cluster
+  rhai-cli migrate run --migration raycluster.backup --target-version 3.5.0 \
+    --raycluster-output-dir /tmp/rhoai-upgrade-backup/ray_cluster
+"
+
+oc cp rhai-migration/rhai-cli-0:/tmp/rhoai-upgrade-backup/ray_cluster ./ray-backup
+----
+
+✓ `./ray-backup/` contains one YAML per RayCluster. `oc get rayclusters -A` still shows both clusters `ready`.
 
 == Exercise 4.2: Back up TrustyAI metrics and data
 
@@ -57,40 +71,32 @@ oc get dsc default-dsc -o jsonpath='trustyai={.spec.components.trustyai.manageme
 oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STORAGE:.spec.storage.format'
 ----
 
-Per the migration guide, metrics are backed up with a per-namespace port-forward + `curl` (no helper script for metrics), and data storage is backed up with the official `backup-data.sh` helper (auto-detects PVC vs DATABASE). Run both for each namespace that has a TrustyAIService.
+In {target-version} both backups are single cluster-wide `rhai-cli migrate prepare` actions — they cover every namespace with a TrustyAIService in one pass, so there's no per-namespace loop. `trustyai.metrics` snapshots the scheduled metrics; `trustyai.data` archives data storage (auto-detecting PVC vs DATABASE from each TrustyAIService CR).
 
-Run the metrics + data backup for *both* TrustyAI service namespaces (`test-trustyaiservice` and `test-trustyaiservice-db`). The block below sets `BACKUP_DIR` explicitly -the rhai-cli image doesn't always set it for non-login shells, and an unset `BACKUP_DIR` makes `curl -o "$BACKUP_DIR/..."` silently write to `/trustyai-metrics-*.json` at the filesystem root where the cleanup tooling won't find it.
+[IMPORTANT]
+====
+`--output-dir` is *required* when running inside the pod. The rhai-cli container root filesystem is read-only, so without an explicit `--output-dir` under the writable backup PVC the action fails with `permission denied`.
+====
+
+Run both actions from inside the rhai-cli pod:
 
 [.console-input]
 [source,role="execute"]
 ----
-for NS in test-trustyaiservice test-trustyaiservice-db; do
-  echo "=== Backing up $NS ==="
-  oc exec -n rhai-migration rhai-cli-0 -it -- bash -c "
-    set -e
-    export BACKUP_DIR=/tmp/rhoai-upgrade-backup/trustyai
-    mkdir -p \"\$BACKUP_DIR\"
-    export NS=$NS
-    export TAS_NAME=\$(oc get trustyaiservice -n \"\$NS\" -o jsonpath='{.items[0].metadata.name}')
-    export SVC_PORT=\$(oc get svc -n \"\$NS\" \"\$TAS_NAME\" -o jsonpath='{.spec.ports[?(@.name==\"http\")].port}')
-    echo \"[INFO] NS=\$NS TAS=\$TAS_NAME PORT=\$SVC_PORT\"
-    # Metrics: port-forward + curl /metrics/all/requests
-    oc port-forward -n \"\$NS\" \"svc/\$TAS_NAME\" 8080:\${SVC_PORT} &
-    PF_PID=\$!; sleep 3
-    curl -sk -H \"Authorization: Bearer \$(oc whoami -t)\" \
-      http://localhost:8080/metrics/all/requests \
-      -o \"\${BACKUP_DIR}/trustyai-metrics-\${NS}-\$(date +%Y%m%d-%H%M%S).json\"
-    kill \$PF_PID 2>/dev/null || true
-    # Data: backup-data.sh auto-detects PVC vs DATABASE per TrustyAIService
-    cd /opt/rhai-upgrade-helpers/trustyai
-    ./backup-data.sh --namespace \"\$NS\"
-  "
-done
+oc exec -n rhai-migration rhai-cli-0 -- bash -c "
+  # Metrics — cluster-wide snapshot to the backup PVC
+  rhai-cli migrate prepare --migration trustyai.metrics --target-version 3.5.0 \
+    --output-dir /tmp/rhoai-upgrade-backup/trustyai
+
+  # Data — cluster-wide; auto-detects PVC vs DATABASE from each TrustyAIService CR
+  rhai-cli migrate prepare --migration trustyai.data --target-version 3.5.0 \
+    --output-dir /tmp/rhoai-upgrade-backup/trustyai
+"
 ----
 
 [NOTE]
 ====
-On a fresh lab `backup-data.sh` may print `[WARN] PVC appears to be empty (0 files copied)` for `test-trustyaiservice` -no bias-detection has been run, so there's no input data. The backup still completes successfully. `test-trustyaiservice-db` produces a SQL dump (the `-db` suffix marks it as database-backed).
+These actions emit a benign `phase pre-upgrade but effective phase is post-upgrade` warning -ignore it. On a fresh lab the data backup may report an empty PVC for `test-trustyaiservice` (no bias-detection has been run, so there's no input data); the backup still completes successfully. `test-trustyaiservice-db` produces a SQL dump (the `-db` suffix marks it as database-backed).
 ====
 
 Outside the pod, capture any `GuardrailsOrchestrator` `spec.otelExporter` blocks so you can restore them post-upgrade (no helper script for this either):
@@ -132,45 +138,38 @@ trustyai-db-test-trustyaiservice-db-20260218-175502/dump.sql
 
 == Exercise 4.3: AI Pipelines pre-upgrade check
 
-DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and 3.3 -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. The rhai-cli helper does both jobs in one pass: snapshots every DSPA pod's health to disk (so `post_upgrade_check.sh` can diff against it in Module 8), then scans for deprecated APIs and custom RBAC roles.
+DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and {target-version} -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. In {target-version} this is two rhai-cli actions: `ai-pipelines.pre-upgrade-check` scans for deprecated APIs and custom RBAC roles, and the `migrate prepare` variant of the same action snapshots every DSPA pod's health to disk (so the post-upgrade check can diff against it in Module 8).
+
+First run the scan:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  bash /opt/rhai-upgrade-helpers/ai_pipelines/check_before_upgrade.sh
+  rhai-cli migrate run --migration ai-pipelines.pre-upgrade-check --target-version 3.5.0
 ----
 
-[.console-output]
-----
-################################################################################
-> Step 1: Pre-Upgrade DSPA Pod Health Check
-> State will be saved to: /tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json
-################################################################################
-
-> DSPA: sample-pipelines | Namespace: dspa-sample
-  Checking pods with prefix 'ds-pipeline-sample-pipelines'...
-    [OK]   ds-pipeline-sample-pipelines-68cf4767c-qsg9t (Running, Ready)
-  Checking pods with prefix 'mariadb-sample-pipelines'...
-    [OK]   mariadb-sample-pipelines-5f46c8cf79-pzfpl (Running, Ready)
-
-> Pre-upgrade state saved to: /tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json
-################################################################################
-> Pre-upgrade: All DSPA pods are healthy
-################################################################################
-################################################################################
-> Step 2: Checking for deprecated DSPA API versions and custom roles
-################################################################################
-################################################################################
-> No deprecated API versions or custom roles found. No need to do anything, proceed with your upgrade.
-################################################################################
-----
-
-For this lab the check passes cleanly -nothing to remediate. On a production cluster the script may report:
+For this lab the check passes cleanly -nothing to remediate. On a production cluster it may report:
 
 * *Warning: deprecated `instructLab` field* -safe to ignore; the field is tolerated during upgrade.
-* *Deprecated v1alpha1 DSPA found* -run the `update_dsp_role.sh` helper or follow migration guide §2.4 step 5 to update each CR.
-* *Custom RBAC roles detected (ArgoCD-managed)* -advisory only; leave as-is or update the GitOps source.
+* *Deprecated v1alpha1 DSPA found* -run `rhai-cli migrate run --migration ai-pipelines.update-dsp-role --target-version 3.5.0` (or update each CR) to move to `v1`.
+* *Custom RBAC roles that require updates* -consult the teams that use AI Pipelines, then run the `ai-pipelines.update-dsp-role` action. If the roles are GitOps/ArgoCD-managed, this is advisory; update the source.
+
+Then capture the pre-upgrade baseline snapshot with the `migrate prepare` variant:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  rhai-cli migrate prepare --migration ai-pipelines.pre-upgrade-check --target-version 3.5.0
+----
+
+This writes `/tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json`.
+
+[IMPORTANT]
+====
+This baseline file must *survive* the upgrade. It lives on the PVC mounted at `/tmp/rhoai-upgrade-backup` — *do not delete the PVC or the rhai-cli StatefulSet before the post-upgrade check runs in Module 7*, or the diff has nothing to compare against.
+====
 
 === Verify
 
@@ -178,7 +177,7 @@ For this lab the check passes cleanly -nothing to remediate. On a production clu
 [source,role="execute"]
 ----
 oc get dspa -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,API:.apiVersion'
-oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ai_pipelines/
+oc exec -n rhai-migration rhai-cli-0 -- ls /tmp/rhoai-upgrade-backup/ai_pipelines/dspa_pre_upgrade_pods.json
 ----
 
 [.console-output]
@@ -188,13 +187,23 @@ dspa-sample   sample-pipelines   datasciencepipelinesapplications.opendatahub.io
 dspa_pre_upgrade_pods.json
 ----
 
-✓ The DSPA is at `apiVersion: …/v1` and `dspa_pre_upgrade_pods.json` is on disk for Module 8 to diff against
+✓ The DSPA is at `apiVersion: …/v1` and `dspa_pre_upgrade_pods.json` is on disk for Module 7 to diff against
 
 == Exercise 4.4: Delete any Llama Stack distributions
 
-Llama Stack's 2→3 transition is "delete and replace." The schema changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. Archiving the in-pod data is out of scope for this workshop; if your LSD owner cares about telemetry/agent state, that's a separate conversation. For the migration itself, the action is just *delete*.
+Llama Stack's 2→3 transition is "delete and replace." In {target-version}, Llama Stack is rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The schema also changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. You'll recreate them as fresh `OGXServer` CRs in Module 7.
 
-If no LSDs are present, this exercise is a no-op. If any exist, delete them so the upgrade has a clean slate and the `llamastackdistribution / config` blocker clears:
+If no LSDs are present, this exercise is a no-op. If any exist, you can first archive their configuration for *reference only* (the SQLite databases cannot be imported into {target-version}'s PostgreSQL) with the `llamastack.backup` action -run it from inside the rhai-cli pod with an explicit `--output-dir`:
+
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -- \
+  rhai-cli migrate prepare --migration llamastack.backup --target-version 3.5.0 \
+  --output-dir /tmp/rhoai-upgrade-backup/llamastack
+----
+
+Then delete every LSD so the upgrade has a clean slate and the `llamastackdistribution / config` blocker clears:
 
 [.console-input]
 [source,role="execute"]
@@ -205,7 +214,7 @@ oc get llamastackdistribution -A -o json \
   | while read NS NAME; do oc delete llamastackdistribution "$NAME" -n "$NS"; done
 ----
 
-You'll deploy a fresh 3.x-shaped LSD in Module 7.
+You'll deploy a fresh `OGXServer` (v1beta1) in Module 7, using the archive only as reference.
 
 === Verify
 
@@ -224,7 +233,7 @@ No resources found
 
 == Exercise 4.5: Update the inferenceservice-config ConfigMap
 
-With every ISVC on RawDeployment (Module 3), apply the hardware-profile ignorelist changes to the `inferenceservice-config` ConfigMap. The official `hardwareprofiles-ignorelist.sh` helper does both jobs the migration guide §2.8.8 calls for: adds `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace` to the disallowed list (so the upgrade can migrate HardwareProfiles cleanly), and prevents InferenceService redeployment during the upgrade by marking the ConfigMap unmanaged.
+With every ISVC on RawDeployment (Module 3), apply the hardware-profile ignorelist changes to the `inferenceservice-config` ConfigMap. The `modelserving.hardwareprofiles-ignorelist` action does both jobs: adds `opendatahub.io/hardware-profile-name` and `opendatahub.io/hardware-profile-namespace` to the disallowed list (so the upgrade can migrate HardwareProfiles cleanly), and prevents InferenceService redeployment during the upgrade by marking the ConfigMap unmanaged (`opendatahub.io/managed=false`).
 
 Back up first so you can restore the 2.x state if anything goes sideways:
 
@@ -237,14 +246,13 @@ oc get configmap inferenceservice-config -n redhat-ods-applications -o yaml \
 ls -lh /tmp/rhoai-upgrade-backup/inferenceservice-config-backup.yaml
 ----
 
-Then run the helper from inside the rhai-cli container:
+Then run the action from inside the rhai-cli container:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/hardwareprofiles-ignorelist.sh \
-  -n redhat-ods-applications
+  rhai-cli migrate run --migration modelserving.hardwareprofiles-ignorelist --target-version 3.5.0
 ----
 
 === Verify
@@ -267,7 +275,9 @@ A side effect of `managed=false` is that the upgrade will *not* redeploy your mo
 
 == Exercise 4.6: Disable Kueue
 
-Leaving Kueue `Managed` at upgrade time is the single highest-risk mistake -its admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster.
+Leaving Kueue `Managed` at upgrade time is the single highest-risk mistake -its admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster. In {target-version}, `Managed` Kueue is *accepted by OLM but rejected at runtime*, so you must land on one of two supported end states before upgrading: *`Removed`* (disable Kueue entirely) or *`Unmanaged`* (hand Kueue to an externally installed Red Hat build of Kueue / RHBOK operator).
+
+*Option A -Removed.* Disable Kueue entirely:
 
 [.console-input]
 [source,role="execute"]
@@ -277,11 +287,33 @@ oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
 }'
 ----
 
-✓ `oc patch` reports `patched` -`kueue.managementState` is now `Removed`. The `KueueReady` DSC condition flips to `False / reason=Removed`, which is expected.
+✓ `oc patch` reports `patched` -`kueue.managementState` is now `Removed`. The `KueueReady` DSC condition flips to `False / reason=Removed`, which is expected (and it stays `False` after the upgrade -normal when Kueue is Removed).
+
+*Option B -Unmanaged (external RHBOK).* Keep Kueue features via the external Red Hat build of Kueue. RHBOK must be installed and operational *first* (the `rhai-cli` RHBOK migration action can automate the move); then set the DSC component `Unmanaged`, optionally naming the default cluster/local queues:
+
+[.console-input]
+[source,role="execute"]
+----
+oc patch $(oc get dsc -o name | head -n1) --type=merge -p '{
+  "spec": { "components": { "kueue": {
+    "managementState": "Unmanaged",
+    "defaultClusterQueueName": "default",
+    "defaultLocalQueueName": "default"
+  } } }
+}'
+----
+
+[IMPORTANT]
+====
+Two caveats apply to the *Unmanaged* path:
+
+* *Queue naming.* RHBOK reserves the name `default`, so rename any existing `LocalQueue` named `default` (e.g. to `rhoai-kueue-default`) before proceeding -otherwise admission breaks.
+* *Namespace labels.* Label each Kueue-managed project `kueue.openshift.io/managed=true`. On a labeled namespace, these kinds must carry the `kueue.x-k8s.io/queue-name` annotation or admission is rejected: *pytorchjob, notebook, rayjob, raycluster, inferenceservice, llminferenceservice*.
+====
 
 == Exercise 4.7: Disable Ray and CodeFlare
 
-The DSC has *two* separate components, `codeflare` and `ray`, even though the rhai-cli reports the blocker under `ray/removal`. Flip both:
+The DSC has *two* separate components, `codeflare` and `ray`, even though the rhai-cli reports the blocker under `ray/removal`. You already set `codeflare` to `Removed` manually in Exercise 4.1, so this patch just confirms it (a no-op) and also removes `ray`:
 
 [.console-input]
 [source,role="execute"]
@@ -367,7 +399,7 @@ done
 oc delete smmr default -n istio-system --ignore-not-found
 ----
 
-✓ Both the SMCP and SMMR are gone. The Service Mesh operator itself is uninstalled in Exercise 4.13.
+✓ Both the SMCP and SMMR are gone. The Service Mesh operator itself is uninstalled in Exercise 4.11.
 
 == Exercise 4.11: Uninstall the 2.x serving operators
 
@@ -395,33 +427,98 @@ oc -n openshift-operators delete subscription servicemeshoperator --ignore-not-f
 oc -n openshift-operators delete csv -l operators.coreos.com/servicemeshoperator.openshift-operators --ignore-not-found
 ----
 
-Finally, delete the Istio CRDs that Service Mesh v2 leaves behind. Uninstalling an operator *never* removes its CRDs, and these leftovers -all labelled `maistra-version` (`heritage: Tiller`, `helm.sh/resource-policy: keep`) -will silently break the 3.x OpenShift Gateway API after the upgrade. The cluster-ingress-operator refuses to install its own `networking.istio.io/v1` Istio CRDs while CRDs it doesn't own already exist (it reports them as `UnknownManagement`), so the `data-science-gateway` never programs and the dashboard URL is unreachable. They are safe to delete now: the SMCP and SMMR are already gone, so no objects reference them.
+[IMPORTANT]
+====
+Do *not* remove `servicemeshoperator3` (OSSM v3). Only the v2 operator (`servicemeshoperator`) is a leftover here. `servicemeshoperator3` is installed by the Cluster Ingress Operator to back the {target-version} *Gateway API* — it's a required part of the new platform, not a migration remnant.
+====
 
-[.console-input]
-[source,role="execute"]
-----
-oc delete crd -l maistra-version --ignore-not-found
-----
+[NOTE]
+====
+*OLM leaves the CSV copies behind for a few seconds.* A CSV is copied into every namespace on the cluster; deleting the *source* CSV makes OLM garbage-collect the copies, but the sweep is not instant. If the verify below still lists `servicemeshoperator.v2.6.17` rows in unrelated namespaces (`cert-manager`, `dspa-sample`, …), wait ~30 seconds and re-run it.
+====
 
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc get csv -A 2>/dev/null | grep -E 'authorino-operator|serverless-operator|servicemeshoperator' | grep -v rhods
-echo "Maistra CRDs remaining: $(oc get crd -l maistra-version --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+oc get csv -A 2>/dev/null | grep -E 'authorino-operator\.|serverless-operator\.|servicemeshoperator\.' | grep -v rhods
 echo "--- check complete ---"
 ----
 
 [.console-output]
 ----
-Maistra CRDs remaining: 0
 --- check complete ---
 ----
 
-✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain, and no `maistra-version`-labelled Istio CRDs are left to block the Gateway API
+✓ No Serverless, Service Mesh 2, or standalone Authorino CSVs remain (the `\.` filter leaves OSSM v3 untouched)
 
-== Exercise 4.12: Re-run the assessment
+== Exercise 4.12: Remove the leftover Service Mesh 2 Istio CRDs
+
+[IMPORTANT]
+====
+*This is the single highest-impact step in the module. Skip it and the upgrade in Module 6 lands with the DSC `Not Ready`.*
+
+OLM operator uninstall *never removes CRDs*, so uninstalling the Service Mesh 2 operator in Exercise 4.11 leaves ~22 Maistra CRDs behind — the `*.istio.io` ones (destinationrules, virtualservices, gateways, …) plus the `*.maistra.io` ones — all labelled `maistra-version=2.6.17`.
+
+After the upgrade, the OpenShift Gateway API "sail" controller *refuses to install its own `networking.istio.io/v1` CRDs while these foreign ones exist*. The ingress-operator log says it plainly: `"Istio CRDs are managed by an unknown party"`. The failure then cascades: `istiod-openshift-gateway` sticks at *0/1* → `Gateway/data-science-gateway` never programs → `GatewayConfig/default-gateway` gets no domain → *ModelRegistry* fails with `failed to compute gateway domain` → the *DSC sits `Not Ready`* with `ProvisioningFailed: modelregistry`.
+
+Removing the CRDs *here*, before the upgrade, avoids the whole chain. (Module 7 Exercise 7.2 documents the after-the-fact recovery if you skip this — but there is no reason to take the damage.)
+====
+
+These CRDs are safe to delete *because nothing on the cluster uses them any more* — you migrated every Serverless ISVC off Istio in Module 3, and the SMCP/SMMR are gone. Prove that first: the count below *must* be `0` before you delete anything.
+
+[.console-input]
+[source,role="execute"]
+----
+TOTAL=0
+for crd in $(oc get crd -l maistra-version -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+  KIND=$(oc get crd "$crd" -o jsonpath='{.spec.names.plural}.{.spec.group}')
+  N=$(oc get "$KIND" -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  TOTAL=$((TOTAL+N))
+  [ "$N" -gt 0 ] && echo "  NON-EMPTY: $crd -> $N custom resource(s)"
+done
+echo "CRDs labelled maistra-version: $(oc get crd -l maistra-version --no-headers | wc -l | tr -d ' ')"
+echo "Custom resources they hold:    $TOTAL"
+----
+
+[.console-output]
+----
+CRDs labelled maistra-version: 22
+Custom resources they hold:    0
+----
+
+If the total is `0`, delete them all by label:
+
+[.console-input]
+[source,role="execute"]
+----
+oc delete crd -l maistra-version
+----
+
+[WARNING]
+====
+If the count is *not* `0`, stop. Something on the cluster still owns Istio resources — most likely a non-RHOAI application that was also using Service Mesh 2. Identify and migrate it (or confirm the resources are disposable) before deleting the CRDs, because deleting a CRD deletes every custom resource of that kind.
+====
+
+=== Verify
+
+[.console-input]
+[source,role="execute"]
+----
+oc get crd -l maistra-version --no-headers 2>/dev/null | wc -l | tr -d ' '
+oc get crd 2>/dev/null | grep -E 'istio\.io|maistra\.io' || echo "no Istio/Maistra CRDs remain"
+----
+
+[.console-output]
+----
+0
+no Istio/Maistra CRDs remain
+----
+
+✓ Zero `maistra-version` CRDs remain, so the {target-version} Gateway API controller can install its own `v1` Istio CRDs cleanly during the upgrade
+
+== Exercise 4.13: Re-run the assessment
 
 Re-run the lint and confirm zero critical findings:
 
@@ -429,7 +526,7 @@ Re-run the lint and confirm zero critical findings:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 \
+  rhai-cli lint --target-version 3.5 \
   | grep -E 'Total:|FAIL|PASS'
 ----
 
@@ -455,11 +552,12 @@ You've completed the platform remediation. You can:
 
 * [x] Back up RayClusters, TrustyAI metrics + data, and AI Pipelines DSPAs before destructive changes, and delete any LlamaStackDistributions
 * [x] Flip every removed component to `Removed` in the correct order
-* [x] Remove the Service Mesh v2 dependency including the lingering member roll and leftover Istio CRDs
+* [x] Remove the Service Mesh v2 dependency including the lingering member roll
+* [x] Delete the leftover Maistra Istio CRDs after a 0-CR safety check
 * [x] Uninstall the 2.x serving operators and confirm a clean assessment
 
 == Module summary
 
-The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators are uninstalled, and all four models are still serving on RawDeployment. The last thing to handle before the upgrade is the workbenches and their images.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators *and their leftover Istio CRDs* are removed, and all four models are still serving on RawDeployment. Clearing those CRDs now is what lets the {target-version} Data Science Gateway program on the first attempt instead of leaving the DSC `Not Ready` after the upgrade. The last thing to handle before the upgrade is the workbenches and their images.
 
 Continue to *Module 5: Handle the workbench images*.

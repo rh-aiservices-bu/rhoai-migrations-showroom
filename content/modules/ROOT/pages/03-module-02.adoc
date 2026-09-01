@@ -30,7 +30,7 @@ oc get dsci default-dsci -o jsonpath='DSCI phase: {.status.phase}{"\n"}'
 
 [.console-output]
 ----
-rhods-operator.2.25.9   Succeeded
+rhods-operator.2.25.10   Succeeded
 DSC phase: Ready
 DSCI phase: Ready
 ----
@@ -39,7 +39,7 @@ DSCI phase: Ready
 
 == Exercise 2.2: Deploy the assessment tool
 
-`rhai-cli` runs from a pod inside the cluster so it can read the OLM CSVs, the DSC/DSCI, and workload custom resources cluster-wide. Create a project and deploy it.
+`rhai-cli` runs from a pod inside the cluster so it can read the OLM CSVs, the DSC/DSCI, and workload custom resources cluster-wide. The container image is `registry.redhat.io/rhoai/rhai-cli-rhel9:v{target-version}.0` (binary `kubectl-odh` version 1.26.4); it pulls with the cluster's global pull secret, so no extra auth is needed. Beyond the read-only `lint` assessment, the same image carries the unified `rhai-cli migrate run|prepare|list` actions that drive the per-component pre- and post-upgrade work in later modules. Create a project and deploy it.
 
 [.console-input]
 [source,role="execute"]
@@ -70,7 +70,7 @@ spec:
     spec:
       containers:
         - name: rhai-cli
-          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.3.5
+          image: registry.redhat.io/rhoai/rhai-cli-rhel9:v3.5.0
           command: ["sh","-c","sleep infinity"]
           volumeMounts:
             - { name: backup, mountPath: /tmp/rhoai-upgrade-backup }
@@ -80,7 +80,7 @@ spec:
 EOF
 ----
 
-Grant the tool's service account `cluster-admin`. Read access is enough for the assessment in this module, but the same pod runs helper scripts in Modules 3, 4, and 7 that create, patch, and delete InferenceServices, ServingRuntimes, ConfigMaps, and other cluster-scoped resources -those calls use the pod's service account token and need write:
+Grant the tool's service account `cluster-admin`. Read access is enough for the assessment in this module, but the same pod runs `rhai-cli migrate` actions in Modules 3, 4, and 7 that create, patch, and delete InferenceServices, ServingRuntimes, ConfigMaps, and other cluster-scoped resources -those calls use the pod's service account token and need write:
 
 [.console-input]
 [source,role="execute"]
@@ -114,32 +114,32 @@ Run the lint against the {target-version} target:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5
+  /opt/rhai-cli/bin/rhai-cli lint --target-version {target-version}
 ----
 
-The output is a table with one row per check: `STATUS | GROUP | KIND | CHECK | IMPACT | MESSAGE`. On this cluster you'll see both component removals *and* impacted workloads:
+The output is a table with one row per check: `STATUS | KIND | GROUP | CHECK | IMPACT | MESSAGE` (note `KIND` precedes `GROUP`). On this cluster you'll see both component removals *and* impacted workloads:
 
 [.console-output]
 ----
 STATUS  KIND                    GROUP       CHECK                         IMPACT    MESSAGE
 ✓       cert-manager            dependency  installed                     info      cert-manager Operator for Red Hat OpenShift installed: cert-manager-operator.v1.20.0
-✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.21.24 meets RHOAI 3.3 minimum version requirement (4.19.9+)
+✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.21.24 meets RHOAI 3.5 minimum version requirement (4.19.9+)
 ✓       servicemesh-v3          dependency  installed                     info      Red Hat Service Mesh v3 (servicemeshoperator3.v3.2.0) is available in the 'stable' channel
 ✓       dsc                     platform    readiness                     info      DataScienceCluster is ready
 ✓       dsci                    platform    readiness                     info      DSCInitialization is ready
-⚠       datasciencepipelines    component   renaming                      warning   DataSciencePipelines component will be renamed to AIPipelines in DSC v2 (RHOAI 3.3)
-✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.3
-✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.3
+⚠       datasciencepipelines    component   renaming                      warning   DataSciencePipelines component will be renamed to AIPipelines in DSC v2 (RHOAI 3.5)
+✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.5
+✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.5
 ⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.17) is installed but no longer required
-✗       kueue                   component   management-state              critical  Kueue managementState is Managed but the 3.3 upgrade only supports Removed. No workloads use Kueue.
-✗       modelmeshserving        component   removal                       critical  ModelMesh Serving is enabled (state: Managed) but will be removed in RHOAI 3.3
-✗       ray                     component   removal                       critical  CodeFlare is enabled (state: Managed) but will be removed in RHOAI 3.3
+✗       kueue                   component   management-state              critical  Kueue managementState is Managed but the 3.5 upgrade only supports Removed or Unmanaged. No workloads use Kueue.
+✗       modelmeshserving        component   removal                       critical  ModelMesh Serving is enabled (state: Managed) but will be removed in RHOAI 3.5
+✗       ray                     component   removal                       critical  CodeFlare is enabled (state: Managed) but will be removed in RHOAI 3.5
 ⚠       trainingoperator        component   deprecation                   warning   TrainingOperator (KFTO v1) is deprecated; will be replaced by Trainer v2 in a future release
 ⚠       guardrails              workload    config-migration              warning   Found 1 GuardrailsOrchestrator(s) using deprecated otelExporter fields - migrate before upgrade
 ⚠       guardrails              workload    impacted-workloads            warning   Found 1 misconfigured GuardrailsOrchestrator(s)
-✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh ServingRuntime(s) - will be impacted in RHOAI 3.3
-✗       kserve                  workload    impacted-workloads            critical  Found 2 Serverless InferenceService(s) - will be impacted in RHOAI 3.3
-✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh InferenceService(s) - will be impacted in RHOAI 3.3
+✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh ServingRuntime(s) - will be impacted in RHOAI 3.5
+✗       kserve                  workload    impacted-workloads            critical  Found 2 Serverless InferenceService(s) - will be impacted in RHOAI 3.5
+✗       kserve                  workload    impacted-workloads            critical  Found 1 ModelMesh InferenceService(s) - will be impacted in RHOAI 3.5
 ⚠       kserve                  workload    impacted-workloads            warning   inferenceservice-config ConfigMap must have opendatahub.io/managed=false and include hardware-profile annotations
 ✗       llamastackdistribution  workload    config                        critical  Found 1 LlamaStackDistribution(s) that must be deleted and recreated. ALL DATA WILL BE LOST.
 ⚠       notebook                workload    impacted-workloads            warning   Found 4 Notebook(s) using 3 unique images: 2 compatible, 1 custom (verification), 1 incompatible (update)
@@ -148,14 +148,14 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ⚠       trainingoperator        workload    impacted-workloads            warning   Found 1 active PyTorchJob(s) - uses deprecated TrainingOperator (KFTO v1)
 
 Environment:
-  OpenShift AI version: 2.25.9 -> 3.3.5
+  OpenShift AI version: 2.25.10 -> 3.5
   OpenShift version:    4.21.24
 
 Summary:
   Total: 40 | Passed: 21 | Warnings: 10 | Failed: 9 | Prohibited: 0
 
 Result:
-  FAIL - blocking findings detected
+  FAIL - blocking findings detected (exit code 1)
 ----
 
 The full report has 40 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
@@ -166,7 +166,7 @@ Save the full report for the record:
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 --output yaml > rhai-cli-output.yaml
+  /opt/rhai-cli/bin/rhai-cli lint --target-version {target-version} --output yaml > rhai-cli-output.yaml
 ----
 
 === Reading the results
@@ -176,8 +176,10 @@ The `IMPACT` column is what matters. rhai-cli emits four levels (`prohibited`, `
 * *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in two shapes:
 ** *Components 3.x removes* -*KServe Serverless*, *Service Mesh v2*, *ModelMesh Serving*, *CodeFlare*, *Kueue*. You disable each in Module 4 after you've migrated its workloads in Module 3.
 ** *Workload findings* you must act on -*Serverless* / *ModelMesh* InferenceServices, the *ModelMesh ServingRuntime*, and the *LlamaStackDistribution*. You convert / delete these in Module 3 (model serving) and Module 4 (LSD).
-* *`warning`* (`⚠`) - things the migration handles automatically *or* that need action but won't block the upgrade by themselves. Examples here: the `datasciencepipelines` → `aipipelines` schema-rename warning (forward-looking — flagged here by the lint but not actually shipped yet in {target-version}; see Module 7 Exercise 7.4), the `inferenceservice-config` ConfigMap patch (you'll run a helper in Module 4), the 4 running workbenches that must be stopped before the upgrade (Module 5), the 2 RayClusters needing pre-upgrade backup (Module 4), the GuardrailsOrchestrator otelExporter migration (Module 7).
+* *`warning`* (`⚠`) - things the migration handles automatically *or* that need action but won't block the upgrade by themselves. Examples here: the `datasciencepipelines` → `aipipelines` schema-rename warning (forward-looking — flagged here by the lint but not actually shipped yet in {target-version}; see Module 7 Exercise 7.4), the `inferenceservice-config` ConfigMap patch (you'll run a `rhai-cli migrate` action in Module 4), the 4 running workbenches that must be stopped before the upgrade (Module 5), the 2 RayClusters needing pre-upgrade backup (Module 4), the GuardrailsOrchestrator otelExporter migration (Module 7).
 * *`info`* (`✓`) - the check passed; nothing to do.
+
+`rhai-cli lint` also signals the overall outcome through its *exit code*: `0` = all checks passed, `1` = one or more `prohibited`/`critical` findings (expected while blockers remain -not a tool error), `2` = warning-only findings. On this cluster the run exits `1`. Re-run the lint after each fix and watch the count fall until no criticals remain.
 
 [IMPORTANT]
 ====
@@ -190,7 +192,7 @@ Note the dependency: the `serverless-removal` and `modelmeshserving/removal` *co
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.3.5 | grep -iE 'critical|warning'
+  /opt/rhai-cli/bin/rhai-cli lint --target-version {target-version} | grep -iE 'critical|warning'
 ----
 
 ✓ You can see the nine critical (`✗`) findings and the ten warning (`⚠`) findings
@@ -297,11 +299,11 @@ test-trustyaiservice      trustyai-service   2h
 
 Each of these has a 2→3 migration concern even though most don't show up as rhai-cli blockers:
 
-* *Feast (`project-alpha/my-featurestore`)* -Tech Preview in 2.25, GA in 3.3. No pre-upgrade action; verify post-upgrade.
+* *Feast (`project-alpha/my-featurestore`)* -Tech Preview in 2.25, GA in {target-version}. No pre-upgrade action; verify post-upgrade.
 * *KFTO (`pytorch-training/pytorch-distributed-training`)* -PyTorchJobs run across the upgrade. No action; verify they survived.
 * *Model Registry* -dashboard nav moves (`Models → Model registry` becomes `AI hub → Registry`) and a new `model-catalog-postgres` pod appears. Verify post-upgrade and tell users about the nav change.
 * *AI Pipelines DSPA* -pre-upgrade DSPA health snapshot in Module 4; post-upgrade DSPA verification in Module 7. (Architectural notes also describe a future DSC `datasciencepipelines` → `aipipelines` rename; that rename hasn't shipped in {target-version}.)
-* *RayClusters* -CodeFlare is removed in 3.x; KubeRay takes over. Back up CR YAMLs before disabling Ray; run the migration script post-upgrade.
+* *RayClusters* -CodeFlare is removed in 3.x; KubeRay takes over. Back up CR YAMLs before disabling Ray; run the `raycluster.migrate` action post-upgrade.
 * *TrustyAI* -storage schema changed. Back up metrics + data before the upgrade; check for data loss and restore post-upgrade.
 
 Inventory the workbenches and custom images:

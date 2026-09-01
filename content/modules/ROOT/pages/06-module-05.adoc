@@ -55,6 +55,16 @@ A custom workbench image built for 2.x makes two assumptions that 3.x breaks:
 
 The fix is a *rebuild* of the image, not a configuration tweak on the cluster. Red Hat does not auto-rebuild custom images -this is an application-owner task.
 
+[NOTE]
+====
+*Not every custom image needs a rebuild -triage each one first.* The image tag alone can't tell you which path an image takes:
+
+* *Built FROM the `2025.2` workbench base image* -the Gateway API / `NB_PREFIX` routing and the kube-rbac-proxy auth wiring are already baked in. Just *re-import* the image (Exercise 5.4) and apply the post-upgrade auth-model patch (the `workbenches.patch-auth-model` action, run in *Module 7*) -*no rebuild*.
+* *Merely tagged `2025.2` on an older base* -the tag is cosmetic; the image still assumes 2.x routing and *needs the full Kubernetes Gateway API rebuild* described below.
+
+Because the tag can't distinguish the two, *verify empirically*: after the upgrade, bring up *one workbench per unique image* and confirm it routes and authenticates before trusting the rest. The lab's `custom-scipy-notebook` is a 2.x community image on an older base, so it takes the rebuild path.
+====
+
 == Exercise 5.3: How the image was updated for 3.x
 
 The rebuild has already been done for you and the result is published at `quay.io/hayesphilip/rhoai-workbench-gw:3.x`. This exercise walks through *exactly* what changed in the Containerfile so you can do the same for your own images. Both the original 2.x BYON Containerfile (`examples/custom-workbench-2x/Containerfile`) and the rebuilt 3.x one (`examples/custom-workbench-gw/Containerfile`) ship with the workshop repo.
@@ -152,6 +162,24 @@ oc annotate imagestream custom-scipy-notebook -n redhat-ods-applications \
 
 `--reference-policy=local` pins the ImageStream to the cluster's internal registry. If you host your custom image there, also grant `system:image-puller` to the workbench ServiceAccount for `redhat-ods-applications`.
 
+[IMPORTANT]
+====
+*Re-registering the ImageStream does not touch workbenches that already exist.*
+
+The two commands above update the *catalogue entry* — what the dashboard offers when someone creates a *new* workbench. The existing `workbenches-regular/custom` workbench keeps its own pinned image reference (`{legacy-workbench-image}`) in `.spec.template.spec.containers[0].image` and will still start on the *2.x* image after the upgrade.
+
+Confirm it for yourself:
+
+[.console-input]
+[source,role="execute"]
+----
+oc get notebook custom -n workbenches-regular \
+  -o jsonpath='notebook still points at: {.spec.template.spec.containers[0].image}{"\n"}'
+----
+
+Repointing the existing workbench is a *post-upgrade* task (the workbench must be stopped for the upgrade anyway, and the auth-model patch in Module 7 Exercise 7.4 has to run first) — it is covered in *Module 7 Exercise 7.9*. Just be aware now that the ImageStream tag alone does not migrate a running workbench; if you stop here, the custom workbench comes back on 3.5 still running its 2.x image.
+====
+
 === Verify
 
 [.console-input]
@@ -161,7 +189,7 @@ oc get imagestream custom-scipy-notebook -n redhat-ods-applications \
   -o jsonpath='{range .status.tags[*]}{.tag}{"\n"}{end}'
 ----
 
-✓ A `3.x` tag now exists on the `custom-scipy-notebook` ImageStream
+✓ A `3.x` tag now exists on the `custom-scipy-notebook` ImageStream (the existing workbench is repointed at it in Module 7)
 
 == Exercise 5.5: Bump out-of-date image tags
 

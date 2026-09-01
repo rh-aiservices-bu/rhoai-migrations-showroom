@@ -5,15 +5,16 @@
 
 This is the heart of the migration. Your cluster runs four models: two on KServe Serverless mode, one on ModelMesh, and one already on KServe RawDeployment. The first three are the work -both Serverless and ModelMesh are removed in 3.x, and if you disable those components while the models still depend on them, the models stop serving. The RawDeployment model is already 3.x-compatible and you leave it alone.
 
-So you convert *first*. In this module you'll convert the two Serverless InferenceServices to RawDeployment using the backup-and-recreate pattern the admission webhook forces, then migrate the ModelMesh model to a single-model KServe RawDeployment. Only after this is done -in Module 4 -will you disable the components.
+So you convert *first*. In this module you'll convert both Serverless InferenceServices to RawDeployment with a single cluster-wide `rhai-cli migrate` action (backup-and-recreate under the hood, because the admission webhook blocks in-place mode edits), then migrate the ModelMesh model in place to a single-model KServe RawDeployment. Only after this is done -in Module 4 -will you disable the components.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
 * Enumerate InferenceServices by deployment mode
-* Convert a Serverless ISVC to RawDeployment with backup-and-recreate (the webhook blocks in-place edits)
-* Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
+* Convert every Serverless ISVC to RawDeployment cluster-wide with one non-interactive `rhai-cli migrate` action
+* Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC in place
+* Recover a PVC-backed OVMS model that the ModelMesh conversion leaves crash-looping
 * Verify every model is RawDeployment and `Ready` before touching the components
 
 == Exercise 3.1: Enumerate what needs converting
@@ -37,65 +38,36 @@ ml-project-c   my-modelmesh-isvc    ModelMesh
 
 Two Serverless and one ModelMesh -all three must be migrated. The already-RawDeployment ISVC (`tinyllama-1b-cpu` in `ml-project-raw`) is filtered out and needs no work.
 
-== Exercise 3.2: Convert the first Serverless ISVC
+== Exercise 3.2: Convert the Serverless ISVCs
 
-The migration guide ships `serverless-to-raw.sh` as the official conversion helper. It's interactive: it checks prerequisites, discovers Serverless InferenceServices in the namespace, prompts you to select which to convert, and handles authentication resources and storage credentials automatically. The KServe admission webhook rejects in-place `oc patch` of `deploymentMode` (manual recreate is the documented fallback in https://access.redhat.com/articles/7134025).
+`modelserving.serverless-to-raw` is the official migrate action. In {target-version} it runs *cluster-wide and non-interactive* — a single invocation converts *every* Serverless ISVC in *all* namespaces at once. There is no per-namespace loop, no interactive model-selection prompt, and no resource-naming choice: each ISVC is converted to RawDeployment *in place*, keeping its original name (`my-serverless-isvc`, `another-sl-model`), and the authentication resources (ServiceAccount, Role, RoleBinding) are handled automatically. The KServe admission webhook rejects in-place `oc patch` of `deploymentMode`, so the action does a backup-and-recreate under the hood (manual fallback: https://access.redhat.com/articles/7134025).
 
-Preview the conversion with `--dry-run` first:
+[NOTE]
+====
+*Both conversion actions in this module prompt for confirmation before they change anything* (`About to convert N InferenceService(s) … Proceed with conversion? [y/N]`). That is why the commands are run with `oc exec -it` — enter `y` at the prompt.
 
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -it -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/serverless-to-raw.sh \
-  --dry-run -n ml-project-a
-----
+The default is `N`, so a stray Enter *cancels*. If you see `User cancelled … conversion` followed by `completed with skipped steps`, nothing was changed — just re-run the command. The `--dry-run` invocations do not prompt.
+====
 
-The script discovers the namespace's Serverless ISVCs and stops at interactive prompts. In `--dry-run` mode there are *two*; with `--delete-existing` (the destructive apply below) there is a *third* confirmation prompt. Step through the first two:
-
-[.console-output]
-----
-📦 Available InferenceServices (Serverless deployment mode only):
-[1] my-serverless-isvc (Mode: Serverless)
-
-🤔 Please select which InferenceServices to migrate:
-Enter 'all' to migrate all InferenceServices
-Enter specific numbers separated by spaces (e.g., '1 3 5')
-Enter 'q' to quit
-Your selection:
-----
-
-Type `all` and press Enter. (For the lab there's only one ISVC, so `1` works too.)
-
-[.console-output]
-----
-🏷️  Resource Naming Options:
-1) Use original names (for in-place replacement)
-2) Use -raw suffix (for side-by-side deployment)
-Enter your choice (1 or 2):
-----
-
-Type `1` and press Enter. *In-place replacement* keeps the ISVC name the same (`my-serverless-isvc`) -that's what Module 1's baseline and Module 8's re-test query by name. The `-raw` suffix path renames everything and would break the symmetry.
-
-In dry-run mode the script writes the generated YAML under `/tmp/rhoai-upgrade-backup/model-serving/serverless-to-raw/<isvc>/` inside the pod (an `original/` snapshot and a `raw-original-names/` rewrite). Review them, then run the same command without `--dry-run` and with `--delete-existing` to let the script handle deletion of the legacy ISVC, ServingRuntime, ServiceAccount, RoleBinding, and Istio Route in one shot:
+Preview the conversion across all namespaces with `--dry-run` first:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -it -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/serverless-to-raw.sh \
-  --delete-existing -n ml-project-a
+  rhai-cli migrate run --migration modelserving.serverless-to-raw --target-version 3.5.0 --dry-run
 ----
 
-Answer the same first two prompts (`all`, then `1`). `--delete-existing` then adds a *third* prompt:
+Review the planned changes for every namespace. When it looks right, apply — re-run the same command without `--dry-run`:
 
-[.console-output]
+[.console-input]
+[source,role="execute"]
 ----
-⚠️  WARNING: IN-PLACE REPLACEMENT MODE
-Please enter 'yes' or 'no':
+oc exec -n rhai-migration rhai-cli-0 -it -- \
+  rhai-cli migrate run --migration modelserving.serverless-to-raw --target-version 3.5.0
 ----
 
-Type `yes` and press Enter. The script deletes the legacy resources and applies the RawDeployment-shaped replacements with the original names. (Anything other than `yes` here aborts.)
+The action removes the legacy Serverless ISVCs, their ServingRuntimes, and the associated auth/Istio resources, then applies the RawDeployment replacements — for both `ml-project-a` and `ml-project-b` in one shot.
 
 === Verify
 
@@ -115,31 +87,25 @@ my-serverless-isvc   RawDeployment    True
 
 ✓ The ISVC reports `RawDeployment` and `True`
 
-== Exercise 3.3: Convert the second Serverless ISVC
+== Exercise 3.3: Confirm both Serverless conversions
 
-Repeat the same helper for `ml-project-b` — same answers as Exercise 3.2 (`all`, then `1`; on the `--delete-existing` apply, `all`, `1`, `yes`):
-
-[.console-input]
-[source,role="execute"]
-----
-oc exec -n rhai-migration rhai-cli-0 -it -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/serverless-to-raw.sh \
-  --dry-run -n ml-project-b
-----
-
-Review the generated files, then apply:
+The single cluster-wide action already converted `ml-project-b` in the same run. Verify it the same way:
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -it -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/serverless-to-raw.sh \
-  --delete-existing -n ml-project-b
+oc get isvc -n ml-project-b -o json \
+  | jq -r '["NAME","DEPLOYMENT_MODE","READY"], (.items[] | [.metadata.name, .status.deploymentMode, (.status.conditions[] | select(.type=="Ready") | .status)]) | @tsv' \
+  | column -t
 ----
 
-Answer `all`, `1`, `yes` at the three prompts as before.
+[.console-output]
+----
+NAME              DEPLOYMENT_MODE  READY
+another-sl-model  RawDeployment    True
+----
 
-=== Verify
+Then confirm no Serverless ISVCs remain anywhere in the cluster:
 
 [.console-input]
 [source,role="execute"]
@@ -212,62 +178,59 @@ oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='{.spec.multiModel}{"\
 
 == Exercise 3.5: Re-host the model on KServe RawDeployment
 
-The migration guide ships `modelmesh-to-raw.sh` (§2.8.7.2) as the official ModelMesh re-host helper. It's interactive: it discovers ModelMesh ISVCs in the source namespace, prompts you to select models, choose a runtime template (single-model OVMS for ONNX, vLLM for LLMs, etc.), configures storage, and creates the new RawDeployment ServingRuntime + InferenceService in a target namespace.
+`modelserving.modelmesh-to-raw` is the official migrate action. In {target-version} it runs *in place in a single namespace and non-interactive* — there is no cross-namespace source→target step, no runtime scale-to-zero dance, and no interactive model/template selection. It discovers the ModelMesh ISVCs, transforms each to a single-model RawDeployment ServingRuntime + ISVC keeping the original name, and (for a natively-supported format like ONNX/OpenVINO IR) selects the single-model `kserve-ovms` runtime automatically. Because it works in place, the old *scale-the-ModelMesh-runtime-to-zero to release an RWO PVC* step no longer applies.
 
-[NOTE]
-====
-The model-store PVC is `ReadWriteOnce` (the default on `gp3-csi`). RWO means only one node can attach the volume at a time. Before the helper applies the new ISVC, release the PVC by scaling the ModelMesh runtime to zero — otherwise the new pod can land on a different node and hang with `Multi-Attach error`. On RWX storage (EFS, CephFS, NFS) this scale-down is not required.
-====
-
-Release the PVC first:
-
-[.console-input]
-[source,role="execute"]
-----
-oc -n ml-project-c patch servingruntime ovms-mm --type=merge -p '{"spec":{"replicas":0}}'
-oc -n ml-project-c wait --for=delete pod -l name=modelmesh-serving-ovms-mm --timeout=120s
-----
-
-For the lab, the new RawDeployment ISVC lives in the *same* namespace as the ModelMesh original (`ml-project-c`). The `modelmesh-to-raw.sh` script has two flag-combinations:
-
-* `--from-ns <A> --target-ns <B>` -cross-namespace, supports `--dry-run` for a safe preview. Source and target must differ.
-* `--from-ns <A> --preserve-namespace` -*in-place*, destructive. Cannot be combined with `--dry-run` (the script errors out: `✗ Error: --dry-run and --preserve-namespace cannot be used together`).
-
-[NOTE]
-====
-For in-place migration there's no dry-run preview — the script is destructive by design. The interactive prompts are the safety net: it asks for a destructive confirmation up front, then which ISVCs to migrate, which runtime template, and what to do with the storage config *before* applying anything, so you can `q` out (or answer `no`) if the choices look wrong. If you want to inspect the generated YAML before any cluster changes, dry-run against a throwaway target namespace first (see *Optional preview* below).
-====
-
-Run the in-place migration:
+Preview first with `--dry-run`, then run the conversion:
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -it -- \
-  /opt/rhai-upgrade-helpers/model-serving/before-upgrade/modelmesh-to-raw.sh \
-  --from-ns ml-project-c --preserve-namespace
+  rhai-cli migrate run --migration modelserving.modelmesh-to-raw --target-version 3.5.0 --dry-run
 ----
 
-Step through the four interactive prompts:
+[.console-input]
+[source,role="execute"]
+----
+oc exec -n rhai-migration rhai-cli-0 -it -- \
+  rhai-cli migrate run --migration modelserving.modelmesh-to-raw --target-version 3.5.0
+----
 
-1. *Destructive-mode confirmation* — the script prints a `⚠️ DESTRUCTIVE OPERATION WARNING` banner and asks `Do you understand the risks and want to continue? (type 'yes' to proceed):`. Type `yes`. Anything else aborts with `👋 Migration cancelled for safety.`
-2. *Selection prompt* — answer `all` to select every ModelMesh ISVC.
-3. *Runtime-template prompt* — the script lists every ServingRuntime template available in the cluster. Press `d` to accept the default, `kserve-ovms` (KServe single-model OpenVINO Model Server). Don't pick `[6] ovms` -that's the multi-model variant you're migrating away from. `kserve-ovms` reads the same `mobilenet/1/model.onnx` from the same PVC, so no model conversion happens.
-4. *Storage-configuration prompt* — the script detects the OpenVINO-style storage and asks whether to update it. Type `1` to *keep current configuration*. (The script transcribes the ModelMesh storage block as-is; you'll fix the resulting webhook error with a small patch after Verify below.)
+The action keeps the original name. The ISVC stays `my-modelmesh-isvc` -only `.status.deploymentMode` flips from `ModelMesh` to `RawDeployment`. Exercise 3.6 cleans up any leftover multi-model ServingRuntime.
 
-[NOTE]
+[WARNING]
 ====
-The default-runtime choice depends on the model format:
+*A PVC-backed OVMS model is NOT fully migrated and will crash-loop — this is the lab's key troubleshooting exercise.*
 
-* *ONNX or OpenVINO IR* (this lab) → `kserve-ovms`
-* *LLM via vLLM (CPU)* → `vllm-cpu-runtime-template`
-* *LLM via vLLM (NVIDIA GPU)* → `vllm-cuda-runtime-template`
-* *Caikit-wrapped LLM* → `caikit-tgis-serving-template`
+Even though `modelserving.modelmesh-to-raw` reports `Migration completed successfully!`, this MobileNet model (PVC-backed OVMS) does *not* come up. The action migrates the ISVC/runtime *metadata* (sets `multiModel=false`, renames the container to `kserve-container`, drops the `modelmesh-enabled` namespace label) but does *not* rewrite three things, so the new RawDeployment predictor never becomes Ready. The symptoms appear in this order:
 
-If the script's default matches your model's format, accept it with `d`. If not, type the corresponding number.
+1. *Webhook rejects the pod* — `storage type must be one of [s3, hdfs, webhdfs]. storage type [pvc] is not supported` (the ModelMesh `storage: {key, path}` block was copied verbatim).
+2. *OVMS crash-loops* — `Configuration file is invalid /models/model_config_list.json` (it kept the multi-model launch args).
+3. *Pod runs but stays `0/1`* — the readiness probe never passes (no container port is declared, so KServe defaults the probe to `tcpSocket:8080`, but OVMS serves REST on 8888).
+
+Apply all three fixes. Values for this lab: ISVC `my-modelmesh-isvc`, namespace `ml-project-c`, runtime `ovms-mm`, PVC `model-store`, model path `mobilenet` (resolve the PVC name from the ModelMesh `storage-config` secret's key if you adapt this to your own cluster):
+
+[source,bash]
+----
+# 1. PVC storage → storageUri
+oc patch isvc my-modelmesh-isvc -n ml-project-c --type=merge \
+  -p '{"spec":{"predictor":{"model":{"storageUri":"pvc://model-store/mobilenet","storage":null}}}}'
+
+# 2. OVMS multi-model args → single-model (serve one model from /mnt/models)
+oc patch servingruntime ovms-mm -n ml-project-c --type=json -p '[{"op":"replace","path":"/spec/containers/0/args","value":[
+  "--model_name=my-modelmesh-isvc","--model_path=/mnt/models","--port=8001","--rest_port=8888",
+  "--file_system_poll_wait_seconds=0","--grpc_bind_address=0.0.0.0","--rest_bind_address=0.0.0.0"]}]'
+
+# 3. Declare the container port + a readiness probe on the OVMS REST port (8888)
+oc patch servingruntime ovms-mm -n ml-project-c --type=json -p '[
+  {"op":"add","path":"/spec/containers/0/ports","value":[{"containerPort":8888,"protocol":"TCP"}]},
+  {"op":"add","path":"/spec/containers/0/readinessProbe","value":{"tcpSocket":{"port":8888},"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5}}]'
+
+oc rollout restart deployment my-modelmesh-isvc-predictor -n ml-project-c
+----
+
+`pvc://model-store/mobilenet` points at the OVMS-layout root; OVMS auto-discovers the `1/` version subdirectory. After the rollout the predictor should reach `1/1` and the ISVC `Ready=True`. Full manual workflow: https://access.redhat.com/articles/7134025.
 ====
-
-`--preserve-namespace` keeps the original name. The ISVC stays `my-modelmesh-isvc` -only `.status.deploymentMode` flips from `ModelMesh` to `RawDeployment`. Exercise 3.6 cleans up the legacy multi-model ServingRuntime.
 
 === Verify
 
@@ -284,31 +247,9 @@ oc get isvc my-modelmesh-isvc -n ml-project-c -o jsonpath='mode={.status.deploym
 mode=RawDeployment ready=True
 ----
 
-[IMPORTANT]
-====
-*Known `modelmesh-to-raw.sh` bug — PVC storage block isn't translated.* The script transcribes the original ModelMesh storage block (`storage: { key: pvc-models, path: mobilenet }`) verbatim into the new ISVC. The KServe RawDeployment admission webhook rejects this with:
-
-----
-Error creating: admission webhook "inferenceservice.kserve-webhook-server.pod-mutator" denied the request:
-storage type must be one of [s3, hdfs, webhdfs]. storage type [pvc] is not supported
-----
-
-If you see this in `oc get events -n ml-project-c`, patch the ISVC to use the KServe `storageUri` form instead:
-
-[source,bash]
-----
-oc patch isvc my-modelmesh-isvc -n ml-project-c --type=json -p='[
-  {"op":"remove","path":"/spec/predictor/model/storage"},
-  {"op":"add","path":"/spec/predictor/model/storageUri","value":"pvc://model-store/mobilenet"}
-]'
-----
-
-The predictor pod should come up within a minute. `pvc://model-store/mobilenet` points at the OVMS-layout root; OVMS auto-discovers the `1/` version subdirectory.
-====
-
 == Exercise 3.6: Remove the ModelMesh ISVC and runtime
 
-Sweep for leftover ModelMesh resources. After in-place `--preserve-namespace` both selectors typically return zero rows (the ISVC was converted in place; the script already removed the multi-model ServingRuntime). For cross-namespace or `-raw`-suffix migrations they catch the leftovers:
+Sweep for leftover ModelMesh resources. Because the in-place conversion keeps the original name and drops `multiModel`, both selectors typically return zero rows already (the ISVC was converted in place; the action removed the multi-model ServingRuntime). The sweep catches any leftovers all the same:
 
 [.console-input]
 [source,role="execute"]
@@ -363,6 +304,11 @@ ml-project-c     my-modelmesh-isvc    RawDeployment   RawDeployment   True
 ml-project-raw   tinyllama-1b-cpu     RawDeployment   RawDeployment   True
 ----
 
+[NOTE]
+====
+*"RawDeployment" is displayed as "Standard" in {target-version}.* You are still on {source-version} here, so the deployment mode reads `RawDeployment` in both the annotation and the status -that's what these checks expect. After the upgrade to {target-version}, the same services show `Standard` in the `DEPLOYMENT_MODE`/`STATUS` columns. It is a display rename, not a re-conversion -no action needed.
+====
+
 === Verify
 
 [.console-input]
@@ -382,7 +328,7 @@ oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."servi
 
 *Issue*: `oc apply` of the recreated ISVC fails with a `deploymentMode` webhook error.
 
-*Solution*: This shouldn't happen when you use the helper script — `serverless-to-raw.sh` creates the new RawDeployment ISVC as a fresh object, which the webhook accepts. The webhook only blocks *changing* mode on an existing object. If you took the manual fallback path (https://access.redhat.com/articles/7134025), confirm you flipped the annotation in your backup file and deleted the old ISVC before re-applying.
+*Solution*: This shouldn't happen with the `rhai-cli migrate` actions — `modelserving.serverless-to-raw` creates the new RawDeployment ISVC as a fresh object, which the webhook accepts. The webhook only blocks *changing* mode on an existing object. If you took the manual fallback path (https://access.redhat.com/articles/7134025), confirm you flipped the annotation in your backup file and deleted the old ISVC before re-applying.
 
 *Issue*: The recreated ISVC sits `READY=False` for several minutes.
 
@@ -390,7 +336,7 @@ oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."servi
 
 *Issue*: You can't delete the multi-model ServingRuntime -"still in use".
 
-*Solution*: Delete the ModelMesh ISVC first (Exercise 3.5). The runtime can only be removed once no ISVC references it.
+*Solution*: Delete the ModelMesh ISVC first (Exercise 3.6). The runtime can only be removed once no ISVC references it.
 
 *Issue*: `oc delete isvc` on a leftover Serverless ISVC hangs forever -it stays in `Terminating` and the delete never returns.
 
@@ -401,8 +347,9 @@ oc get isvc -A -o json | jq -r '[.items[] | select((.metadata.annotations."servi
 You've completed the conversion phase. You can:
 
 * [x] Enumerate InferenceServices by deployment mode
-* [x] Convert Serverless ISVCs to RawDeployment with backup-and-recreate
-* [x] Migrate a ModelMesh model off multi-model serving
+* [x] Convert every Serverless ISVC to RawDeployment cluster-wide with one non-interactive `rhai-cli migrate` action
+* [x] Migrate a ModelMesh model off multi-model serving in place
+* [x] Recover a PVC-backed OVMS model that the conversion leaves crash-looping
 * [x] Confirm the entire serving surface is RawDeployment and Ready
 
 == Module summary

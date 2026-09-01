@@ -78,7 +78,7 @@ podman build \
 podman push quay.io/hayesphilip/rhoai-workbench-gw:3.x
 ```
 
-The `:3.x` tag signals this image is compatible with the 3.x line broadly. If you maintain it for a specific minor release later, tag accordingly (`:3.3`, `:3.4`, etc.).
+The `:3.x` tag signals this image is compatible with the 3.x line broadly. If you maintain it for a specific minor release later, tag accordingly (`:3.5`, `:3.4`, etc.).
 
 ## 4. Smoke-test the pushed images
 

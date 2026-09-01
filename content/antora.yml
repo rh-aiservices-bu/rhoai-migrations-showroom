@@ -1,5 +1,5 @@
 name: modules
-title: Migrating RHOAI 2.25 to 3.3
+title: Migrating RHOAI 2.25 to 3.5
 version: master
 start_page: index.adoc
 nav:
@@ -7,13 +7,13 @@ nav:
 
 asciidoc:
   attributes:
-    lab_name: "Migrating Red Hat OpenShift AI 2.25 to 3.3"
+    lab_name: "Migrating Red Hat OpenShift AI 2.25 to 3.5"
     release-version: master
     page-pagination: '@'
     source-version: "2.25"
-    target-version: "3.3.5"
-    migration-channel: "support-required-upgrade"
-    stable-channel: "stable-3.3"
+    target-version: "3.5"
+    migration-channel: "support-required-upgrade-3.5"
+    stable-channel: "stable-3.5"
     # Custom workbench images used in Module 4. Build + push instructions are in
     # examples/README.md.
     legacy-workbench-image: "quay.io/hayesphilip/rhoai-workbench-2x:lab-4.2.5"
@@ -30,5 +30,5 @@ asciidoc:
     keycloak_admin_user:              "temp-admin"
     keycloak_admin_password:          "<lab-provided>"
     page-links:
-    - url: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3
-      text: RHOAI 3.3 docs
+    - url: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5
+      text: RHOAI 3.5 docs

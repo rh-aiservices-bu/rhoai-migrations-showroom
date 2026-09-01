@@ -52,7 +52,7 @@ Gateway Programmed: True
 
 == Exercise 8.2: Inference test each model
 
-Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test.
+Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test. All predictors now report their deployment mode as `Standard` (in {target-version}, `RawDeployment` was renamed to *`Standard`*).
 
 [.console-input]
 [source,role="execute"]
@@ -124,22 +124,42 @@ done
 
 Expect HTTP 200, 302, or 303 from each workbench.
 
+[WARNING]
+====
+*A 302 here does not prove the workbench is running -check the pods too.*
+
+The redirect is issued by the Gateway's auth layer *before* the request is routed to a workbench pod. A stopped workbench returns exactly the same `HTTP 302` as a healthy one, so this curl passes even when all four workbenches are down — which is the state you are in if you skipped Module 7 Exercise 7.9, since Module 5 stopped every one of them.
+
+Confirm the pods are actually up:
+
+[.console-input]
+[source,role="execute"]
+----
+for nb in $(oc get notebooks -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
+  ns="${nb%/*}"; name="${nb##*/}"
+  POD=$(oc -n "$ns" get pods -l notebook-name="$name" --no-headers 2>/dev/null | awk '{print $2" "$3}')
+  echo "$nb  ${POD:-STOPPED - start it in Module 7 Exercise 7.9}"
+done
+----
+
+Every workbench must report `2/2 Running` (notebook container + `kube-rbac-proxy`).
+====
+
 === Verify
 
 [.console-input]
 [source,role="execute"]
 ----
-oc exec -n rhai-migration rhai-cli-0 -- bash -c '
-  cd /opt/rhai-upgrade-helpers/workbenches && \
-  ./workbench-2.x-to-3.x-upgrade.sh list --all
-' | grep -E "Legacy|Migrated"
+oc exec -n rhai-migration rhai-cli-0 -- \
+  /opt/rhai-cli/bin/rhai-cli migrate run \
+  --migration workbenches.verify-migration --target-version {target-version}.0 | grep -E "Legacy|Migrated"
 ----
 
 ✓ `Legacy (2.x): 0` and all workbenches show as migrated
 
 == Exercise 8.4: Confirm the DSPA serves the pipelines API
 
-The DSPA is reconciled by the same `datasciencepipelines` component as pre-upgrade. Hit the API root + list pipelines:
+The DSPA is reconciled by the AI Pipelines component -on {target-version} the DSC v1→v2 conversion renamed `datasciencepipelines` to `aipipelines`, but the DSPA itself is unchanged. Hit the API root + list pipelines:
 
 [.console-input]
 [source,role="execute"]
@@ -169,7 +189,7 @@ oc get dspa -A -o json | jq -r '[.items[] | select(.status.conditions[]? | selec
 
 == Exercise 8.5: Confirm Ray clusters accept work
 
-Module 7 Exercise 7.4 ran the KubeRay migration script. Confirm each cluster is still `ready` and reports its worker count:
+Module 7 Exercise 7.5 ran the KubeRay migration action. Confirm each cluster is still `ready` and reports its worker count:
 
 [.console-input]
 [source,role="execute"]
@@ -198,7 +218,7 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 *Issue*: The dashboard URL returns `000` or `503`, or the `data-science-gateway` Gateway shows `PROGRAMMED=False`.
 
-*Solution*: The Gateway API isn't serving. The most common cause on an upgraded cluster is leftover Service Mesh v2 (Maistra) Istio CRDs that were never removed in Module 4 -they block the cluster-ingress-operator from installing its own `v1` Istio CRDs, so the gateway never programs. See Module 7's Troubleshooting entry "The dashboard URL is unreachable and the `data-science-gateway` Gateway shows `PROGRAMMED=False`" for the full diagnosis and recovery (`oc delete crd -l maistra-version` then restart the ingress operator).
+*Solution*: The Gateway API isn't serving. The most common cause on an upgraded cluster is leftover Service Mesh v2 (Maistra) Istio CRDs that were never removed in Module 4 -they block the cluster-ingress-operator from installing its own `v1` Istio CRDs, so the gateway never programs. See Module 7 *Exercise 7.2* for the full diagnosis and recovery (delete the stale `*.istio.io` CRDs, then restart the ingress operator).
 
 *Issue*: An LLM inference returns 502 or 503.
 
@@ -206,7 +226,7 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 *Issue*: A workbench URL returns 404.
 
-*Solution*: The Gateway HTTPRoute hasn't propagated yet. Wait 2 minutes and re-test. If still 404, confirm the workbench Notebook CR has been patched (Module 7 Exercise 7.3).
+*Solution*: The Gateway HTTPRoute hasn't propagated yet. Wait 2 minutes and re-test. If still 404, confirm the workbench Notebook CR has been patched (Module 7 Exercise 7.4).
 
 *Issue*: The DSPA endpoint returns 404.
 
@@ -214,7 +234,7 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 *Issue*: A Ray cluster isn't `ready`.
 
-*Solution*: Re-run the Module 7 migration helper for that cluster: `oc exec -n rhai-migration rhai-cli-0 -it -- python3 /opt/rhai-upgrade-helpers/ray/ray_cluster_migration.py post-upgrade --namespace <ns>`.
+*Solution*: Re-run the Module 7 migration action scoped to that cluster: `oc exec -n rhai-migration rhai-cli-0 -- /opt/rhai-cli/bin/rhai-cli migrate run --migration raycluster.migrate --target-version {target-version}.0 --raycluster-namespace <ns>`.
 
 == Learning outcomes
 
