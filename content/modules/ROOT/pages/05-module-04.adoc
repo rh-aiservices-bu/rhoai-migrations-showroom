@@ -3,7 +3,7 @@
 :toc: macro
 :toclevels: 2
 
-With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path (and Llama Stack is rebranded OGX in {target-version}), so the action is delete pre-upgrade and recreate fresh as an `OGXServer` post-upgrade (a configuration archive is available for reference only). This module starts with backups, deletes the LSDs, then runs the disables, then the {target-version} prerequisites, then operator uninstalls.
+With every model converted to RawDeployment, it's safe to start the platform work -but in the *right order*. Real clusters carry workloads the workshop has so far ignored: Ray clusters, TrustyAI services, AI Pipelines. Their data must be captured *before* you flip the components that host them, because some of those flips destroy state. Llama Stack is the one exception: its 2→3 transition has no compatible upgrade path (and Llama Stack is rebranded OGX in 3.5), so the action is delete pre-upgrade and recreate fresh as an `OGXServer` post-upgrade (a configuration archive is available for reference only). This module starts with backups, deletes the LSDs, then runs the disables, then the 3.5 prerequisites, then operator uninstalls.
 
 In this module you'll back up every workload whose data can be lost across the upgrade (Ray clusters, TrustyAI metrics, AI Pipelines), delete any LSDs so they can be recreated fresh in Module 7, update the `inferenceservice-config` ConfigMap with the hardware-profile ignorelist, flip the removed DSC components to `Removed`, tear down the Service Mesh v2 dependency, and finally uninstall the 2.x serving operators.
 
@@ -18,15 +18,15 @@ By the end of this module, you'll be able to:
 * Flip the removed DSC components (`ray`, `codeflare`, `modelmeshserving`, `kserve.serving`) to `Removed`, and set `kueue` to `Removed` or `Unmanaged`
 * Remove the Service Mesh v2 dependency including the lingering member roll
 * Uninstall the OpenShift Serverless, Service Mesh 2, and standalone Authorino operators
-* Remove the leftover Maistra Istio CRDs so the {target-version} Gateway API can install its own
+* Remove the leftover Maistra Istio CRDs so the 3.5 Gateway API can install its own
 
 == Exercise 4.1: Back up the RayClusters
 
-The `codeflare` operator is removed in {target-version}; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields.
+The `codeflare` operator is removed in 3.5; KubeRay takes over Ray cluster management. Existing RayCluster CRs survive the controller swap, but back them up to disk first in case reconciliation drops fields.
 
 [IMPORTANT]
 ====
-Unlike the old 2.x helper script, the `raycluster.backup` action does *not* flip `codeflare` for you — and it *fails if CodeFlare is still `Managed`*. You must set `codeflare` to `Removed` in the DSC *manually, before* running the backup. Disabling CodeFlare is also a hard {target-version} upgrade prerequisite, required even if you have no RayClusters.
+Unlike the old 2.x helper script, the `raycluster.backup` action does *not* flip `codeflare` for you — and it *fails if CodeFlare is still `Managed`*. You must set `codeflare` to `Removed` in the DSC *manually, before* running the backup. Disabling CodeFlare is also a hard 3.5 upgrade prerequisite, required even if you have no RayClusters.
 
 Do this only when you are ready to upgrade: CodeFlare provides essential security configuration for user-created RayClusters, so if you set it `Removed` and then delay the upgrade, users could create RayClusters while CodeFlare is absent.
 ====
@@ -71,7 +71,7 @@ oc get dsc default-dsc -o jsonpath='trustyai={.spec.components.trustyai.manageme
 oc get trustyaiservice -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,STORAGE:.spec.storage.format'
 ----
 
-In {target-version} both backups are single cluster-wide `rhai-cli migrate prepare` actions — they cover every namespace with a TrustyAIService in one pass, so there's no per-namespace loop. `trustyai.metrics` snapshots the scheduled metrics; `trustyai.data` archives data storage (auto-detecting PVC vs DATABASE from each TrustyAIService CR).
+In 3.5 both backups are single cluster-wide `rhai-cli migrate prepare` actions — they cover every namespace with a TrustyAIService in one pass, so there's no per-namespace loop. `trustyai.metrics` snapshots the scheduled metrics; `trustyai.data` archives data storage (auto-detecting PVC vs DATABASE from each TrustyAIService CR).
 
 [IMPORTANT]
 ====
@@ -138,7 +138,7 @@ trustyai-db-test-trustyaiservice-db-20260218-175502/dump.sql
 
 == Exercise 4.3: AI Pipelines pre-upgrade check
 
-DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and {target-version} -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. In {target-version} this is two rhai-cli actions: `ai-pipelines.pre-upgrade-check` scans for deprecated APIs and custom RBAC roles, and the `migrate prepare` variant of the same action snapshots every DSPA pod's health to disk (so the post-upgrade check can diff against it in Module 8).
+DSPA pipelines themselves keep running across the upgrade, but the schema changed between 2.25 and 3.5 -deprecated fields (the old `instructLab` block) and any leftover `v1alpha1` DSPA CRs need detection. In 3.5 this is two rhai-cli actions: `ai-pipelines.pre-upgrade-check` scans for deprecated APIs and custom RBAC roles, and the `migrate prepare` variant of the same action snapshots every DSPA pod's health to disk (so the post-upgrade check can diff against it in Module 8).
 
 First run the scan:
 
@@ -191,9 +191,9 @@ dspa_pre_upgrade_pods.json
 
 == Exercise 4.4: Delete any Llama Stack distributions
 
-Llama Stack's 2→3 transition is "delete and replace." In {target-version}, Llama Stack is rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The schema also changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. You'll recreate them as fresh `OGXServer` CRs in Module 7.
+Llama Stack's 2→3 transition is "delete and replace." In 3.5, Llama Stack is rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The schema also changed (SQLite → PostgreSQL, VectorDB API removed, Inference API became OpenAI-compatible), and there's no in-place data migration -so existing LSDs cannot be carried across. You'll recreate them as fresh `OGXServer` CRs in Module 7.
 
-If no LSDs are present, this exercise is a no-op. If any exist, you can first archive their configuration for *reference only* (the SQLite databases cannot be imported into {target-version}'s PostgreSQL) with the `llamastack.backup` action -run it from inside the rhai-cli pod with an explicit `--output-dir`:
+If no LSDs are present, this exercise is a no-op. If any exist, you can first archive their configuration for *reference only* (the SQLite databases cannot be imported into 3.5's PostgreSQL) with the `llamastack.backup` action -run it from inside the rhai-cli pod with an explicit `--output-dir`:
 
 [.console-input]
 [source,role="execute"]
@@ -275,7 +275,7 @@ A side effect of `managed=false` is that the upgrade will *not* redeploy your mo
 
 == Exercise 4.6: Disable Kueue
 
-Leaving Kueue `Managed` at upgrade time is the single highest-risk mistake -its admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster. In {target-version}, `Managed` Kueue is *accepted by OLM but rejected at runtime*, so you must land on one of two supported end states before upgrading: *`Removed`* (disable Kueue entirely) or *`Unmanaged`* (hand Kueue to an externally installed Red Hat build of Kueue / RHBOK operator).
+Leaving Kueue `Managed` at upgrade time is the single highest-risk mistake -its admission webhook intercepts Job creation cluster-wide, and during the operator upgrade the webhook and its CRDs fall out of sync, which can reject Job submissions for *any* workload on the cluster. In 3.5, `Managed` Kueue is *accepted by OLM but rejected at runtime*, so you must land on one of two supported end states before upgrading: *`Removed`* (disable Kueue entirely) or *`Unmanaged`* (hand Kueue to an externally installed Red Hat build of Kueue / RHBOK operator).
 
 *Option A -Removed.* Disable Kueue entirely:
 
@@ -429,7 +429,7 @@ oc -n openshift-operators delete csv -l operators.coreos.com/servicemeshoperator
 
 [IMPORTANT]
 ====
-Do *not* remove `servicemeshoperator3` (OSSM v3). Only the v2 operator (`servicemeshoperator`) is a leftover here. `servicemeshoperator3` is installed by the Cluster Ingress Operator to back the {target-version} *Gateway API* — it's a required part of the new platform, not a migration remnant.
+Do *not* remove `servicemeshoperator3` (OSSM v3). Only the v2 operator (`servicemeshoperator`) is a leftover here. `servicemeshoperator3` is installed by the Cluster Ingress Operator to back the 3.5 *Gateway API* — it's a required part of the new platform, not a migration remnant.
 ====
 
 [NOTE]
@@ -516,7 +516,7 @@ oc get crd 2>/dev/null | grep -E 'istio\.io|maistra\.io' || echo "no Istio/Maist
 no Istio/Maistra CRDs remain
 ----
 
-✓ Zero `maistra-version` CRDs remain, so the {target-version} Gateway API controller can install its own `v1` Istio CRDs cleanly during the upgrade
+✓ Zero `maistra-version` CRDs remain, so the 3.5 Gateway API controller can install its own `v1` Istio CRDs cleanly during the upgrade
 
 == Exercise 4.13: Re-run the assessment
 
@@ -558,6 +558,6 @@ You've completed the platform remediation. You can:
 
 == Module summary
 
-The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators *and their leftover Istio CRDs* are removed, and all four models are still serving on RawDeployment. Clearing those CRDs now is what lets the {target-version} Data Science Gateway program on the first attempt instead of leaving the DSC `Not Ready` after the upgrade. The last thing to handle before the upgrade is the workbenches and their images.
+The platform is now pre-upgrade-clean: every workload with persistent state is backed up off-cluster, every removed component is `Removed`, the Service Mesh v2 dependency is gone, the 2.x operators *and their leftover Istio CRDs* are removed, and all four models are still serving on RawDeployment. Clearing those CRDs now is what lets the 3.5 Data Science Gateway program on the first attempt instead of leaving the DSC `Not Ready` after the upgrade. The last thing to handle before the upgrade is the workbenches and their images.
 
 Continue to *Module 5: Handle the workbench images*.

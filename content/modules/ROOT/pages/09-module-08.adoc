@@ -52,7 +52,7 @@ Gateway Programmed: True
 
 == Exercise 8.2: Inference test each model
 
-Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test. All predictors now report their deployment mode as `Standard` (in {target-version}, `RawDeployment` was renamed to *`Standard`*).
+Two probes per ISVC. The predictor pod state proves the workload is *alive*; an HTTP request to the model endpoint proves it's *serving* requests. ISVCs with an external `https://` URL get hit over HTTP; ISVCs with only an in-cluster `svc.cluster.local` URL (Headless service config) skip the HTTP probe -their pod state is the smoke test. All predictors now report their deployment mode as `Standard` (in 3.5, `RawDeployment` was renamed to *`Standard`*).
 
 [.console-input]
 [source,role="execute"]
@@ -152,14 +152,14 @@ Every workbench must report `2/2 Running` (notebook container + `kube-rbac-proxy
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration workbenches.verify-migration --target-version {target-version}.0 | grep -E "Legacy|Migrated"
+  --migration workbenches.verify-migration --target-version 3.5.0 | grep -E "Legacy|Migrated"
 ----
 
 ✓ `Legacy (2.x): 0` and all workbenches show as migrated
 
 == Exercise 8.4: Confirm the DSPA serves the pipelines API
 
-The DSPA is reconciled by the AI Pipelines component -on {target-version} the DSC v1→v2 conversion renamed `datasciencepipelines` to `aipipelines`, but the DSPA itself is unchanged. Hit the API root + list pipelines:
+The DSPA is reconciled by the AI Pipelines component -on 3.5 the DSC v1→v2 conversion renamed `datasciencepipelines` to `aipipelines`, but the DSPA itself is unchanged. Hit the API root + list pipelines:
 
 [.console-input]
 [source,role="execute"]
@@ -234,7 +234,7 @@ oc get raycluster -A -o json | jq -r '[.items[] | select(.status.state == "ready
 
 *Issue*: A Ray cluster isn't `ready`.
 
-*Solution*: Re-run the Module 7 migration action scoped to that cluster: `oc exec -n rhai-migration rhai-cli-0 -- /opt/rhai-cli/bin/rhai-cli migrate run --migration raycluster.migrate --target-version {target-version}.0 --raycluster-namespace <ns>`.
+*Solution*: Re-run the Module 7 migration action scoped to that cluster: `oc exec -n rhai-migration rhai-cli-0 -- /opt/rhai-cli/bin/rhai-cli migrate run --migration raycluster.migrate --target-version 3.5.0 --raycluster-namespace <ns>`.
 
 == Learning outcomes
 
@@ -248,4 +248,4 @@ You've validated the user-visible workloads on the new platform. You can:
 
 == Module summary
 
-Every user-visible workload still works on {target-version}. Continue to the *Conclusion* to review what the workshop accomplished and what production migrations typically need on top of what the lab covered.
+Every user-visible workload still works on 3.5. Continue to the *Conclusion* to review what the workshop accomplished and what production migrations typically need on top of what the lab covered.

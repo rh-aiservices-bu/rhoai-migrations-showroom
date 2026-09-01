@@ -3,13 +3,13 @@
 :toc: macro
 :toclevels: 2
 
-The operator is on {target-version} and the DSC is `Ready`, but the migration isn't finished. The 3.x reconciler needs a few `rhai-cli migrate run` actions to bring components fully across (ConfigMap state, workbench auth, RayCluster CRs, GuardrailsOrchestrator schema, TrustyAI data). This module runs those actions, verifies the components no action covers, brings the workbenches back into service, clears the leftovers the removed controllers abandoned, and then sweeps every workload to confirm they survived the upgrade.
+The operator is on 3.5 and the DSC is `Ready`, but the migration isn't finished. The 3.x reconciler needs a few `rhai-cli migrate run` actions to bring components fully across (ConfigMap state, workbench auth, RayCluster CRs, GuardrailsOrchestrator schema, TrustyAI data). This module runs those actions, verifies the components no action covers, brings the workbenches back into service, clears the leftovers the removed controllers abandoned, and then sweeps every workload to confirm they survived the upgrade.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
-* Confirm the operator, DSC, and DSCI are healthy on {target-version} and the Data Science Gateway is `Programmed`
+* Confirm the operator, DSC, and DSCI are healthy on 3.5 and the Data Science Gateway is `Programmed`
 * Run the required post-upgrade `rhai-cli migrate run` actions (ConfigMap, workbenches, Ray, GuardrailsOrchestrator)
 * Recover the Data Science Gateway when leftover Service Mesh 2 Istio CRDs block it
 * Verify the components no migrate action covers (KFTO, Feature Store, TrustyAI)
@@ -38,13 +38,13 @@ NAME                   PROGRAMMED
 data-science-gateway   True
 ----
 
-✓ Operator on {target-version}, DSC + DSCI both `Ready`, and the Data Science Gateway is `Programmed=True`
+✓ Operator on 3.5, DSC + DSCI both `Ready`, and the Data Science Gateway is `Programmed=True`
 
 The **Data Science Gateway must be `Programmed=True`** -the dashboard, model endpoints, and Model Registry all resolve through it. If it isn't, work through the Service Mesh 2 leftover-CRD recovery in Exercise 7.2 *before* verifying any component.
 
 [NOTE]
 ====
-*What the operator handles automatically.* Several tasks that were manual admin steps in earlier releases are now done by the {target-version} operator on startup -do *not* attempt them by hand:
+*What the operator handles automatically.* Several tasks that were manual admin steps in earlier releases are now done by the 3.5 operator on startup -do *not* attempt them by hand:
 
 * *HardwareProfile migration* -AcceleratorProfiles are converted to HardwareProfiles and Notebooks/InferenceServices are annotated (create-only; your customizations are preserved).
 * *GatewayConfig `ingressMode` preservation* -a LoadBalancer ingress mode is carried forward (no regression to OcpRoute).
@@ -119,19 +119,19 @@ The recovery cascade is quick once the CRDs are gone -in lab testing `istiod-ope
 
 == Exercise 7.3: Restore the inferenceservice-config ConfigMap
 
-In Module 4 you marked `inferenceservice-config` as `managed=false` so the upgrade couldn't redeploy your ISVCs. With the operator on {target-version}, hand control back. The `modelserving.managed-isvc-config` migrate action restores the annotation, restarts the KServe controller, and verifies that no ISVC was silently redeployed.
+In Module 4 you marked `inferenceservice-config` as `managed=false` so the upgrade couldn't redeploy your ISVCs. With the operator on 3.5, hand control back. The `modelserving.managed-isvc-config` migrate action restores the annotation, restarts the KServe controller, and verifies that no ISVC was silently redeployed.
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration modelserving.managed-isvc-config --target-version {target-version}.0
+  --migration modelserving.managed-isvc-config --target-version 3.5.0
 ----
 
 === Verify
 
-Confirm the ConfigMap is back under management, then confirm each ISVC came back `Ready` and reporting its deployment mode as `Standard` (in {target-version}, `RawDeployment` was renamed to *`Standard`*):
+Confirm the ConfigMap is back under management, then confirm each ISVC came back `Ready` and reporting its deployment mode as `Standard` (in 3.5, `RawDeployment` was renamed to *`Standard`*):
 
 [.console-input]
 [source,role="execute"]
@@ -183,7 +183,7 @@ done
 ----
 oc exec -n rhai-migration rhai-cli-0 -it -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration workbenches.patch-auth-model --target-version {target-version}.0 \
+  --migration workbenches.patch-auth-model --target-version 3.5.0 \
   --only-stopped --with-cleanup
 ----
 
@@ -194,7 +194,7 @@ oc exec -n rhai-migration rhai-cli-0 -it -- \
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration workbenches.verify-migration --target-version {target-version}.0
+  --migration workbenches.verify-migration --target-version 3.5.0
 ----
 
 ✓ Output reports `Legacy (2.x): 0` and `All workbenches have been migrated`
@@ -213,11 +213,11 @@ The CodeFlare operator is gone; KubeRay manages Ray clusters directly. This step
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration raycluster.migrate --target-version {target-version}.0 --dry-run
+  --migration raycluster.migrate --target-version 3.5.0 --dry-run
 
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration raycluster.migrate --target-version {target-version}.0
+  --migration raycluster.migrate --target-version 3.5.0
 ----
 
 The action migrates all clusters at once; scope to one with `--raycluster-cluster` / `--raycluster-namespace`, or recreate from a backup with `--raycluster-from-backup`. Each migrated cluster restarts its head + worker pods.
@@ -248,11 +248,11 @@ Two *cluster-wide* actions cover every GuardrailsOrchestrator at once (no per-na
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration trustyai.patch-guardrails --target-version {target-version}.0
+  --migration trustyai.patch-guardrails --target-version 3.5.0
 
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration trustyai.migrate-gorch-otel-exporter --target-version {target-version}.0
+  --migration trustyai.migrate-gorch-otel-exporter --target-version 3.5.0
 ----
 
 If your Module 4 backup detected that scheduled TrustyAI metrics were lost across the upgrade, restore them from the archive with the `trustyai.metrics` action (scoped to the namespace, using the backed-up file and route label):
@@ -262,7 +262,7 @@ If your Module 4 backup detected that scheduled TrustyAI metrics were lost acros
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration trustyai.metrics --target-version {target-version}.0 \
+  --migration trustyai.metrics --target-version 3.5.0 \
   --namespace <namespace> --file <backup-file> --route-label 'trustyai-service-name=<tas-name>' --skip-existing
 ----
 
@@ -278,7 +278,7 @@ oc get guardrailsorchestrator -A
 
 == Exercise 7.7: Confirm every workload survived
 
-Sweep every component that was running before the upgrade. All should be present and healthy on {target-version}.
+Sweep every component that was running before the upgrade. All should be present and healthy on 3.5.
 
 [.console-input]
 [source,role="execute"]
@@ -316,12 +316,12 @@ Then run the AI Pipelines post-upgrade check, which compares AI Pipelines server
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration ai-pipelines.post-upgrade-check --target-version {target-version}.0
+  --migration ai-pipelines.post-upgrade-check --target-version 3.5.0
 ----
 
 [NOTE]
 ====
-*Llama Stack → OGX.* In {target-version}, Llama Stack was rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The 2.x CRs were deleted pre-upgrade (Module 4 Exercise 4.4). Any replacement is built fresh from the pre-upgrade archive as *reference only* -the SQLite data cannot be imported, since 3.x requires PostgreSQL 14+ and the `Vector_IO` API.
+*Llama Stack → OGX.* In 3.5, Llama Stack was rebranded *OGX (Open GenAI Stack)* and the `LlamaStackDistribution` CR is replaced by *`OGXServer` (v1beta1)*. The 2.x CRs were deleted pre-upgrade (Module 4 Exercise 4.4). Any replacement is built fresh from the pre-upgrade archive as *reference only* -the SQLite data cannot be imported, since 3.x requires PostgreSQL 14+ and the `Vector_IO` API.
 
 [WARNING]
 ====
@@ -377,17 +377,17 @@ oc get pytorchjob -A
 
 oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli migrate run \
-  --migration training.verify-workloads --target-version {target-version}.0
+  --migration training.verify-workloads --target-version 3.5.0
 ----
 
 [IMPORTANT]
 ====
 *A `[BLOCKER]` here is expected on this lab and does not mean the upgrade failed.* The lab's PyTorchJob is still `Running`, so the action reports `1 active v1 job(s) must complete or be stopped before migration` and *exits with code 1*.
 
-That blocker is about a *future* migration to Kubeflow Trainer v2 -it is telling you an active v1 job would have to drain first. For the 2.25 → {target-version} upgrade you are doing here, the success criterion is simply that the job is still `Running` (or `Succeeded`) and appears in the same list as before the upgrade.
+That blocker is about a *future* migration to Kubeflow Trainer v2 -it is telling you an active v1 job would have to drain first. For the 2.25 → 3.5 upgrade you are doing here, the success criterion is simply that the job is still `Running` (or `Succeeded`) and appears in the same list as before the upgrade.
 ====
 
-*Feature Store.* Feast moves from Tech Preview in {source-version} to GA in {target-version}. Confirm the operator is up and the store is `Ready`, then prove materialization actually still works by running one of its CronJobs on demand:
+*Feature Store.* Feast moves from Tech Preview in {source-version} to GA in 3.5. Confirm the operator is up and the store is `Ready`, then prove materialization actually still works by running one of its CronJobs on demand:
 
 [.console-input]
 [source,role="execute"]
@@ -548,13 +548,13 @@ oc get isvc my-modelmesh-isvc -n ml-project-c \
 
 == Exercise 7.11: Final assessment
 
-Re-run the rhai-cli lint to confirm the tool sees a healthy cluster on {target-version}. `lint` is a pre-upgrade gate: when the current version already equals the target, it short-circuits with a "no checks will be executed" line -that itself is the pass signal. Your post-upgrade confidence comes from the per-component verifications above and the Module 8 workload re-tests, not from re-running lint.
+Re-run the rhai-cli lint to confirm the tool sees a healthy cluster on 3.5. `lint` is a pre-upgrade gate: when the current version already equals the target, it short-circuits with a "no checks will be executed" line -that itself is the pass signal. Your post-upgrade confidence comes from the per-component verifications above and the Module 8 workload re-tests, not from re-running lint.
 
 [.console-input]
 [source,role="execute"]
 ----
 oc exec -n rhai-migration rhai-cli-0 -- \
-  /opt/rhai-cli/bin/rhai-cli lint --target-version {target-version} 2>&1 \
+  /opt/rhai-cli/bin/rhai-cli lint --target-version 3.5 2>&1 \
   | tail -5
 ----
 
@@ -567,7 +567,7 @@ Environment:
 Current and target versions are the same (3.5), no checks will be executed.
 ----
 
-✓ `Current and target versions are the same` -the migration is on {target-version} and there is nothing left for the lint to check
+✓ `Current and target versions are the same` -the migration is on 3.5 and there is nothing left for the lint to check
 
 == Troubleshooting
 
@@ -607,7 +607,7 @@ Current and target versions are the same (3.5), no checks will be executed.
 
 You've completed the platform-side migration. You can:
 
-* [x] Confirm the operator, DSC, and DSCI are healthy on {target-version} and the Data Science Gateway is `Programmed`
+* [x] Confirm the operator, DSC, and DSCI are healthy on 3.5 and the Data Science Gateway is `Programmed`
 * [x] Recover the gateway from leftover Service Mesh 2 Istio CRDs
 * [x] Restore the `inferenceservice-config` ConfigMap to managed
 * [x] Patch workbenches onto kube-rbac-proxy, including the legacy OAuth resource cleanup
@@ -621,6 +621,6 @@ You've completed the platform-side migration. You can:
 
 == Module summary
 
-The cluster is fully migrated to {target-version} *and back in service*. The four ISVCs serve on Standard (formerly RawDeployment) deployment mode through Gateway API, all four workbenches are patched onto kube-rbac-proxy and running again — the custom one on its rebuilt Gateway-API image — RayClusters are on KubeRay, Guardrails are on the new schema, KFTO / Feast / TrustyAI are verified, the retired ModelMesh controller's orphaned Deployment is gone, and the lint is clean. Module 8 closes the loop by running simple smoke tests on the user-visible workloads -inference, workbench access, pipelines, Ray jobs.
+The cluster is fully migrated to 3.5 *and back in service*. The four ISVCs serve on Standard (formerly RawDeployment) deployment mode through Gateway API, all four workbenches are patched onto kube-rbac-proxy and running again — the custom one on its rebuilt Gateway-API image — RayClusters are on KubeRay, Guardrails are on the new schema, KFTO / Feast / TrustyAI are verified, the retired ModelMesh controller's orphaned Deployment is gone, and the lint is clean. Module 8 closes the loop by running simple smoke tests on the user-visible workloads -inference, workbench access, pipelines, Ray jobs.
 
 Continue to *Module 8: Re-test the migrated workloads*.

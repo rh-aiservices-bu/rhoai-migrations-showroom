@@ -40,7 +40,7 @@ Two Serverless and one ModelMesh -all three must be migrated. The already-RawDep
 
 == Exercise 3.2: Convert the Serverless ISVCs
 
-`modelserving.serverless-to-raw` is the official migrate action. In {target-version} it runs *cluster-wide and non-interactive* — a single invocation converts *every* Serverless ISVC in *all* namespaces at once. There is no per-namespace loop, no interactive model-selection prompt, and no resource-naming choice: each ISVC is converted to RawDeployment *in place*, keeping its original name (`my-serverless-isvc`, `another-sl-model`), and the authentication resources (ServiceAccount, Role, RoleBinding) are handled automatically. The KServe admission webhook rejects in-place `oc patch` of `deploymentMode`, so the action does a backup-and-recreate under the hood (manual fallback: https://access.redhat.com/articles/7134025).
+`modelserving.serverless-to-raw` is the official migrate action. In 3.5 it runs *cluster-wide and non-interactive* — a single invocation converts *every* Serverless ISVC in *all* namespaces at once. There is no per-namespace loop, no interactive model-selection prompt, and no resource-naming choice: each ISVC is converted to RawDeployment *in place*, keeping its original name (`my-serverless-isvc`, `another-sl-model`), and the authentication resources (ServiceAccount, Role, RoleBinding) are handled automatically. The KServe admission webhook rejects in-place `oc patch` of `deploymentMode`, so the action does a backup-and-recreate under the hood (manual fallback: https://access.redhat.com/articles/7134025).
 
 [NOTE]
 ====
@@ -178,7 +178,7 @@ oc get servingruntime ovms-mm -n ml-project-c -o jsonpath='{.spec.multiModel}{"\
 
 == Exercise 3.5: Re-host the model on KServe RawDeployment
 
-`modelserving.modelmesh-to-raw` is the official migrate action. In {target-version} it runs *in place in a single namespace and non-interactive* — there is no cross-namespace source→target step, no runtime scale-to-zero dance, and no interactive model/template selection. It discovers the ModelMesh ISVCs, transforms each to a single-model RawDeployment ServingRuntime + ISVC keeping the original name, and (for a natively-supported format like ONNX/OpenVINO IR) selects the single-model `kserve-ovms` runtime automatically. Because it works in place, the old *scale-the-ModelMesh-runtime-to-zero to release an RWO PVC* step no longer applies.
+`modelserving.modelmesh-to-raw` is the official migrate action. In 3.5 it runs *in place in a single namespace and non-interactive* — there is no cross-namespace source→target step, no runtime scale-to-zero dance, and no interactive model/template selection. It discovers the ModelMesh ISVCs, transforms each to a single-model RawDeployment ServingRuntime + ISVC keeping the original name, and (for a natively-supported format like ONNX/OpenVINO IR) selects the single-model `kserve-ovms` runtime automatically. Because it works in place, the old *scale-the-ModelMesh-runtime-to-zero to release an RWO PVC* step no longer applies.
 
 Preview first with `--dry-run`, then run the conversion:
 
@@ -306,7 +306,7 @@ ml-project-raw   tinyllama-1b-cpu     RawDeployment   RawDeployment   True
 
 [NOTE]
 ====
-*"RawDeployment" is displayed as "Standard" in {target-version}.* You are still on {source-version} here, so the deployment mode reads `RawDeployment` in both the annotation and the status -that's what these checks expect. After the upgrade to {target-version}, the same services show `Standard` in the `DEPLOYMENT_MODE`/`STATUS` columns. It is a display rename, not a re-conversion -no action needed.
+*"RawDeployment" is displayed as "Standard" in 3.5.* You are still on {source-version} here, so the deployment mode reads `RawDeployment` in both the annotation and the status -that's what these checks expect. After the upgrade to 3.5, the same services show `Standard` in the `DEPLOYMENT_MODE`/`STATUS` columns. It is a display rename, not a re-conversion -no action needed.
 ====
 
 === Verify

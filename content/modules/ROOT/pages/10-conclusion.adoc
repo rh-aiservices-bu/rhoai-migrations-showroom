@@ -2,7 +2,7 @@
 :source-highlighter: rouge
 :page-pagination!:
 
-Congratulations -you've migrated a production-shaped Red Hat OpenShift AI {source-version} cluster to {target-version}, carrying live model-serving and workbench workloads across a breaking platform change.
+Congratulations -you've migrated a production-shaped Red Hat OpenShift AI {source-version} cluster to 3.5, carrying live model-serving and workbench workloads across a breaking platform change.
 
 == What you accomplished
 
@@ -12,10 +12,10 @@ You ran the full assessment-driven migration on a cluster that wasn't a clean de
 * *Assessed* the cluster with `rhai-cli lint`, separated critical findings from warnings, and learned the assessment is not a workload inventory.
 * *Converted the model-serving workloads* -the hard part: two Serverless ISVCs converted to RawDeployment with backup-and-recreate (the webhook blocks in-place edits), and a ModelMesh model migrated off multi-model serving -*before* disabling the components that hosted them.
 * *Backed up every workload with persistent state* -RayCluster CRs (via the `rhai-cli migrate` backup action), TrustyAI metrics + storage + Guardrails otelExporter config, and the AI Pipelines pre-upgrade DSPA snapshot. The backups are what give you a recovery path if a component drops state during the upgrade. Llama Stack (now OGX) is the exception -its 2→3 transition has no compatible upgrade path, so it is archived for reference and deleted pre-upgrade.
-* *Remediated the platform* -disabled the removed components in the correct order, tore down the Service Mesh v2 dependency including the lingering member roll, uninstalled the 2.x operators, and deleted the Maistra Istio CRDs those operators left behind so the {target-version} Gateway API could install its own.
+* *Remediated the platform* -disabled the removed components in the correct order, tore down the Service Mesh v2 dependency including the lingering member roll, uninstalled the 2.x operators, and deleted the Maistra Istio CRDs those operators left behind so the 3.5 Gateway API could install its own.
 * *Handled the workbenches* -discovered and retired an orphaned custom image, bumped out-of-date tags, and stopped every workbench.
-* *Upgraded* through the `{migration-channel}` channel to {target-version}, then moved to `{stable-channel}`.
-* *Verified* the result -platform healthy, all four models still serving on RawDeployment (displayed as *Standard* in {target-version}) through Gateway API (the three you migrated plus the one already on RawDeployment), schema and HardwareProfiles migrated, RayClusters migrated to KubeRay-only management, and KFTO PyTorchJobs / Feast / Model Registry / AI Pipelines / TrustyAI all confirmed working against their pre-upgrade state.
+* *Upgraded* through the `{migration-channel}` channel to 3.5, then moved to `{stable-channel}`.
+* *Verified* the result -platform healthy, all four models still serving on RawDeployment (displayed as *Standard* in 3.5) through Gateway API (the three you migrated plus the one already on RawDeployment), schema and HardwareProfiles migrated, RayClusters migrated to KubeRay-only management, and KFTO PyTorchJobs / Feast / Model Registry / AI Pipelines / TrustyAI all confirmed working against their pre-upgrade state.
 * *Returned the cluster to service* -patched the workbenches onto kube-rbac-proxy, cleared the legacy OAuth Routes and Secrets, repointed the custom workbench at its rebuilt Gateway-API image, restarted every workbench, and removed the orphaned ModelMesh runtime Deployment the retired controller abandoned.
 * *Re-tested* every user-facing workload against the new Gateway URLs and diffed against the Module 1 baseline. The before/after archive pair is your evidence that the migration didn't silently break anything.
 

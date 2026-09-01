@@ -3,17 +3,17 @@
 :toc: macro
 :toclevels: 2
 
-The cluster is pre-upgrade-clean: models converted to RawDeployment, removed components disabled, 2.x operators uninstalled, workbenches stopped. Now you'll trigger the migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to {target-version}.
+The cluster is pre-upgrade-clean: models converted to RawDeployment, removed components disabled, 2.x operators uninstalled, workbenches stopped. Now you'll trigger the migration by switching the operator subscription to a dedicated migration channel and approving the upgrade as OLM walks it to 3.5.
 
-The migration channel is separate from the normal release channels so the upgrade can't be triggered by accident -and it's the only channel that provides the cross-major 2.25->{target-version} path (its edge carries `skipRange >=2.25.10 <2.26.0`, so any 2.25.10+ patch resolves straight to {target-version}). When the operator is on {target-version}, you'll install the JobSet operator that Kueue now depends on, then move the subscription onto the stable channel for ongoing patches.
+The migration channel is separate from the normal release channels so the upgrade can't be triggered by accident -and it's the only channel that provides the cross-major 2.25->3.5 path (its edge carries `skipRange >=2.25.10 <2.26.0`, so any 2.25.10+ patch resolves straight to 3.5). When the operator is on 3.5, you'll install the JobSet operator that Kueue now depends on, then move the subscription onto the stable channel for ongoing patches.
 
 == Learning objectives
 
 By the end of this module, you'll be able to:
 
 * Switch the operator subscription to the `{migration-channel}` migration channel
-* Approve the OLM InstallPlan as the upgrade resolves to {target-version}
-* Install the JobSet operator that Kueue depends on in {target-version}
+* Approve the OLM InstallPlan as the upgrade resolves to 3.5
+* Install the JobSet operator that Kueue depends on in 3.5
 * Confirm the operator and DSC reach a healthy state on the new version
 * Move the subscription to the `{stable-channel}` channel for ongoing updates
 
@@ -100,10 +100,10 @@ channel=support-required-upgrade-3.5
 
 [IMPORTANT]
 ====
-Because the `support-required-upgrade-3.5` edge carries `skipRange >=2.25.10 <2.26.0`, any 2.25.10+ patch resolves to a *single* InstallPlan straight to {target-version} -there is no intermediate 2.25.z hop. Approve it under Manual approval mode. If OLM does generate more than one InstallPlan, approve each in sequence -the loop below handles either case.
+Because the `support-required-upgrade-3.5` edge carries `skipRange >=2.25.10 <2.26.0`, any 2.25.10+ patch resolves to a *single* InstallPlan straight to 3.5 -there is no intermediate 2.25.z hop. Approve it under Manual approval mode. If OLM does generate more than one InstallPlan, approve each in sequence -the loop below handles either case.
 ====
 
-This loop approves whatever unapproved InstallPlan exists and waits until the {target-version} CSV reports `Succeeded`. If OLM generates a follow-on InstallPlan, the loop approves that too:
+This loop approves whatever unapproved InstallPlan exists and waits until the 3.5 CSV reports `Succeeded`. If OLM generates a follow-on InstallPlan, the loop approves that too:
 
 [.console-input]
 [source,role="execute"]
@@ -140,7 +140,7 @@ rhods-operator.3.5.0   Red Hat OpenShift AI   3.5.0   rhods-operator.2.25.10   S
 
 [WARNING]
 ====
-*Do not approve the Service Mesh Operator 3 upgrade to 3.4.0.* Once RHOAI {target-version} is installed, OLM parks a separate "upgrade available" InstallPlan in front of the `servicemeshoperator3` subscription. This is a *different operator* from the `rhods-operator` InstallPlans you just approved — the loop above only touches `redhat-ods-operator`.
+*Do not approve the Service Mesh Operator 3 upgrade to 3.4.0.* Once RHOAI 3.5 is installed, OLM parks a separate "upgrade available" InstallPlan in front of the `servicemeshoperator3` subscription. This is a *different operator* from the `rhods-operator` InstallPlans you just approved — the loop above only touches `redhat-ods-operator`.
 
 On OCP 4.19–4.21 the cluster-ingress-operator hardcodes the Gateway API Istio version to `v1.26.2`, and OSSM 3.4.0 rejects that version as end-of-life. Approving it leaves `openshift-gateway` in a permanent `ReconcileError` with *no supported downgrade*. Keep the Service Mesh Operator on `installPlanApproval: Manual` and pin it ≤ 3.5.x until link:https://redhat.atlassian.net/browse/OSSM-14917[OSSM-14917^] / link:https://redhat.atlassian.net/browse/OCPBUGS-92038[OCPBUGS-92038^] ship a fix. Confirm no 3.4.0 InstallPlan is auto-approved:
 
@@ -164,7 +164,7 @@ oc get csv -n redhat-ods-operator -o jsonpath='{range .items[?(@.spec.displayNam
 
 == Exercise 6.4: Install the JobSet operator
 
-New in {target-version}: Kueue depends on the *JobSet* operator. Without it the DSC stays *Not Ready* with `KueueReady=False`. Install it into its *own* namespace with an *OwnNamespace* OperatorGroup -do *not* use `openshift-operators`:
+New in 3.5: Kueue depends on the *JobSet* operator. Without it the DSC stays *Not Ready* with `KueueReady=False`. Install it into its *own* namespace with an *OwnNamespace* OperatorGroup -do *not* use `openshift-operators`:
 
 [.console-input]
 [source,role="execute"]
@@ -280,7 +280,7 @@ DSC: Ready
 DSCI: Ready
 ----
 
-✓ Both the DSC and DSCI are `Ready` under {target-version}
+✓ Both the DSC and DSCI are `Ready` under 3.5
 
 == Exercise 6.6: Move off the migration channel
 
@@ -334,13 +334,13 @@ channel=stable-3.5  state=AtLatestKnown  installedCSV=rhods-operator.3.5.0
 You've completed the upgrade. You can:
 
 * [x] Switch the subscription to the `{migration-channel}` migration channel
-* [x] Approve the OLM upgrade as it resolves to {target-version}
+* [x] Approve the OLM upgrade as it resolves to 3.5
 * [x] Install the JobSet operator that Kueue depends on
 * [x] Confirm the operator, DSC, and DSCI are healthy on the new version
 * [x] Move the subscription to `{stable-channel}` for ongoing updates
 
 == Module summary
 
-The operator is now on {target-version}, the DSC and DSCI are `Ready`, and the subscription is on the stable channel. In the final module you'll verify the migrated cluster end to end -especially that all four models are still serving.
+The operator is now on 3.5, the DSC and DSCI are `Ready`, and the subscription is on the stable channel. In the final module you'll verify the migrated cluster end to end -especially that all four models are still serving.
 
 Continue to *Module 7: Post-upgrade verification*.

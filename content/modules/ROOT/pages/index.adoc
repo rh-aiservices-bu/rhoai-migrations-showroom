@@ -1,11 +1,11 @@
-= Migrating Red Hat OpenShift AI {source-version} to {target-version}
+= Migrating Red Hat OpenShift AI {source-version} to 3.5
 :source-highlighter: rouge
 :toc: macro
 :toclevels: 2
 
 toc::[]
 
-Welcome to the Red Hat OpenShift AI migration workshop. You'll take a *production-shaped* OpenShift AI {source-version} cluster through an in-place migration to {target-version} -and unlike a clean demo cluster, this one has real workloads that don't survive a naive upgrade.
+Welcome to the Red Hat OpenShift AI migration workshop. You'll take a *production-shaped* OpenShift AI {source-version} cluster through an in-place migration to 3.5 -and unlike a clean demo cluster, this one has real workloads that don't survive a naive upgrade.
 
 This is a *migration*, not a routine version bump. Moving from {source-version} to 3.x changes the routing layer (OpenShift Routes to Kubernetes Gateway API), the authentication model (oauth-proxy to kube-rbac-proxy), *removes* several components your workloads currently depend on -Serverless model serving, ModelMesh, and CodeFlare -and *replaces* the embedded Kueue with the external Red Hat build of Kueue (RHBOK). You can't just disable the removed components -you have to migrate the workloads off them first, in the right order, or you lose running models.
 
@@ -192,7 +192,7 @@ Your lab cluster was provisioned with OpenShift AI {source-version} in a realist
 * *Sample workbenches and a Data Science Pipelines application*
 * The 2.x serving stack: Service Mesh 2, OpenShift Serverless, and standalone Authorino
 
-Your job is to carry all of it cleanly onto {target-version}.
+Your job is to carry all of it cleanly onto 3.5.
 
 == What you'll do
 
@@ -204,7 +204,7 @@ Your job is to carry all of it cleanly onto {target-version}.
 | *Module 3: Convert serving* | Convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe -*before* the components that host them are removed.
 | *Module 4: Remediate platform* | Flip the removed components to `Removed`, patch the model-serving ConfigMap, remove the Service Mesh dependency, and uninstall the 2.x operators.
 | *Module 5: Workbench images* | Discover the custom workbench image, learn what a custom image needs to change for 3.x, re-register it to a rebuilt image, bump out-of-date tags, and stop every workbench.
-| *Module 6: Upgrade* | Switch to the migration channel, drive the OLM upgrade to {target-version}, then move to the stable channel.
+| *Module 6: Upgrade* | Switch to the migration channel, drive the OLM upgrade to 3.5, then move to the stable channel.
 | *Module 7: Verify* | Confirm the platform is healthy, the converted models still serve, the schema and HardwareProfiles migrated, and workbenches are patched onto the new auth model.
 | *Module 8: Re-test* | Re-run every test from Module 1 against the migrated endpoints and diff against the baseline.
 |===

@@ -12,7 +12,7 @@ You are the *cluster administrator* responsible for a production Red Hat OpenShi
 Previous OpenShift AI version bumps were routine operator upgrades. The move to 3.x is different. In a single transition:
 
 * *Components are removed*: KServe Serverless mode, ModelMesh Serving, and CodeFlare are all gone in 3.x. The embedded Kueue is replaced by the external Red Hat build of Kueue (RHBOK), and the embedded Service Mesh dependency is dropped. You cannot simply disable these -any workload running on them must be migrated off *first*, or it stops serving.
-* *Components are renamed*: Llama Stack is rebranded as *OGX (Open GenAI Stack)* -the `LlamaStackDistribution` CR is replaced by `OGXServer` (v1beta1) -and `RawDeployment` model serving is displayed as *Standard* in {target-version}.
+* *Components are renamed*: Llama Stack is rebranded as *OGX (Open GenAI Stack)* -the `LlamaStackDistribution` CR is replaced by `OGXServer` (v1beta1) -and `RawDeployment` model serving is displayed as *Standard* in 3.5.
 * *Routing changes*: OpenShift Routes are replaced by Kubernetes Gateway API. Model endpoint URLs and the dashboard URL change.
 * *Authentication changes*: the oauth-proxy sidecar is replaced by kube-rbac-proxy. Workbenches built for 2.x must be patched, and custom images rebuilt.
 * *Schema changes*: HardwareProfiles move to a new API group with renamed objects, and the DSC/DSCI move from the v1 to the v2 API -the operator converts them automatically on startup (including the `datasciencepipelines` → `aipipelines` rename, and dropping the removed `modelmeshserving` and `codeflare` fields).
@@ -48,7 +48,7 @@ By the end of this workshop you will be able to:
 * Migrate a ModelMesh model to a single-model KServe RawDeployment ISVC
 * Disable removed components in the correct order, and tear down the Service Mesh dependency cleanly
 * Discover and triage custom workbench images for the new auth and routing model
-* Drive the OLM-managed upgrade to {target-version} and verify the migrated cluster end to end
+* Drive the OLM-managed upgrade to 3.5 and verify the migrated cluster end to end
 
 == Estimated time
 
