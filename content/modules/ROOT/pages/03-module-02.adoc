@@ -121,7 +121,12 @@ The output is a table with one row per check: `STATUS | KIND | GROUP | CHECK | I
 
 [.console-output]
 ----
-STATUS  KIND                    GROUP       CHECK                         IMPACT    MESSAGE
+╔═══════════════════════════════════════════════════════════╗
+║  Prohibited Violations Detected: Upgrade is NOT POSSIBLE  ║
+╚═══════════════════════════════════════════════════════════╝
+  ‼  [component / operator-installed] Kueue managementState is Managed — migration to the Red Hat build of Kueue operator is required before upgrading
+
+STATUS  KIND                    GROUP       CHECK                         IMPACT      MESSAGE
 ✓       cert-manager            dependency  installed                     info      cert-manager Operator for Red Hat OpenShift installed: cert-manager-operator.v1.20.0
 ✓       openshift-platform      dependency  version-requirement           info      OpenShift 4.21.24 meets RHOAI 3.5 minimum version requirement (4.19.9+)
 ✓       servicemesh-v3          dependency  installed                     info      Red Hat Service Mesh v3 (servicemeshoperator3.v3.2.0) is available in the 'stable' channel
@@ -131,6 +136,7 @@ STATUS  KIND                    GROUP       CHECK                         IMPACT
 ✗       kserve                  component   serverless-removal            critical  KServe serverless mode is enabled (state: Managed) but will be removed in RHOAI 3.5
 ✗       kserve                  component   servicemesh-removal           critical  ServiceMesh is enabled (state: Managed) but is no longer required by RHOAI 3.5
 ⚠       kserve                  component   servicemesh-operator-upgrade  warning   Service Mesh Operator v2 (servicemeshoperator.v2.6.17) is installed but no longer required
+‼       kueue                   component   operator-installed            prohibited  Kueue managementState is Managed — migration to the Red Hat build of Kueue operator is required before upgrading
 ✗       kueue                   component   management-state              critical  Kueue managementState is Managed but the 3.5 upgrade only supports Removed or Unmanaged. No workloads use Kueue.
 ✗       modelmeshserving        component   removal                       critical  ModelMesh Serving is enabled (state: Managed) but will be removed in RHOAI 3.5
 ✗       ray                     component   removal                       critical  CodeFlare is enabled (state: Managed) but will be removed in RHOAI 3.5
@@ -152,13 +158,13 @@ Environment:
   OpenShift version:    4.21.24
 
 Summary:
-  Total: 40 | Passed: 21 | Warnings: 10 | Failed: 9 | Prohibited: 0
+  Total: 44 | Passed: 22 | Warnings: 12 | Failed: 9 | Prohibited: 1
 
 Result:
-  FAIL - blocking findings detected (exit code 1)
+  PROHIBITED - upgrade is not possible
 ----
 
-The full report has 40 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
+The full report has 44 checks; the table above shows the ones that need action (`✗`) and the most relevant warnings (`⚠`). Successful `info` rows -cert-manager installed, OCP version OK, DSC Ready, DataSciencePipelines ready for the rename, no legacy HardwareProfiles, no v1alpha1 DSPAs, etc. -are also part of the 21 `Passed` count.
 
 Save the full report for the record:
 
@@ -169,9 +175,22 @@ oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli lint --target-version 3.5 --output yaml > rhai-cli-output.yaml
 ----
 
+[IMPORTANT]
+====
+*The `PROHIBITED - upgrade is not possible` banner is the expected result at this point -it is not an error and it does not mean your cluster is misconfigured.*
+
+It is raised by the *Kueue* check, and it is telling you the truth: with `kueue` still `Managed`, the {source-version} → 3.5 upgrade genuinely cannot proceed. Two rows report the same problem at different severities -`kueue / operator-installed` (prohibited) and `kueue / management-state` (critical).
+
+You clear it in *Module 4 Exercise 4.6* by setting `kueue` to `Removed` (or `Unmanaged` for external RHBOK). Do not try to fix it now: Module 3 has to migrate the model-serving workloads first, and the disables all happen together in Module 4. After Module 4 the same command reports `Total: 38 | Passed: 31 | Warnings: 7 | Failed: 0 | Prohibited: 0`.
+
+`lint` exits non-zero here (`1`), so if you are running it in a script, expect that.
+====
+
 === Reading the results
 
-The `IMPACT` column is what matters. rhai-cli emits four levels (`prohibited`, `critical`, `warning`, `info`); on this cluster the report has `critical`, `warning`, and `info`:
+The `IMPACT` column is what matters. rhai-cli emits four levels (`prohibited`, `critical`, `warning`, `info`) and this cluster produces all four:
+
+* *`prohibited`* (`‼`) - the hard stop. It prints its own banner above the table and the run ends with `PROHIBITED - upgrade is not possible` instead of `FAIL`. On this cluster there is exactly one, and it is the *Kueue* `operator-installed` check.
 
 * *`critical`* (`✗`) - the upgrade will not proceed, or will break the cluster, until you resolve these. They come in two shapes:
 ** *Components 3.x removes* -*KServe Serverless*, *Service Mesh v2*, *ModelMesh Serving*, *CodeFlare*, *Kueue*. You disable each in Module 4 after you've migrated its workloads in Module 3.
@@ -195,7 +214,7 @@ oc exec -n rhai-migration rhai-cli-0 -- \
   /opt/rhai-cli/bin/rhai-cli lint --target-version 3.5 | grep -iE 'critical|warning'
 ----
 
-✓ You can see the nine critical (`✗`) findings and the ten warning (`⚠`) findings
+✓ You can see the one prohibited (`‼`), nine critical (`✗`) and twelve warning (`⚠`) findings
 
 == Exercise 2.4: The assessment is not a workload inventory
 
@@ -354,6 +373,6 @@ You've completed the assessment phase. You can:
 
 == Module summary
 
-The cluster has nine critical findings (component removals + workload conversions), ten warnings, and live workloads behind nearly every blocker. You cannot clear the Serverless and ModelMesh component criticals until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 4 then runs the rest of the platform prep -backups, ConfigMap update, LSD delete, and the operator uninstalls.
+The cluster has one prohibited finding (Kueue), nine critical findings (component removals + workload conversions), twelve warnings, and live workloads behind nearly every blocker. You cannot clear the Serverless and ModelMesh component criticals until you migrate the models off them. In the next module you'll do exactly that: convert the Serverless ISVCs to RawDeployment and migrate the ModelMesh model to KServe. Module 4 then runs the rest of the platform prep -backups, ConfigMap update, LSD delete, and the operator uninstalls.
 
 Continue to *Module 3: Convert the model-serving workloads*.
